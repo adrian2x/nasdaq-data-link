@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Environment variables (contains API keys)
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Output files
+output/
+*.csv
+*.zip
+*.arrow
+
+# Temporary files
+*_temp.csv
