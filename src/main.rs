@@ -152,14 +152,14 @@ fn load_or_create_api_key() -> Result<String> {
     Ok(api_key)
 }
 
-/// Parse a path line from paths.txt, extracting path and query parameters
+/// Parse a path line from paths.txt, extracting path, query parameters, and output filename
 /// 
 /// # Arguments
-/// * `line` - A line from paths.txt (e.g., "SHARADAR/SF1.json -q dimension=MRT")
+/// * `line` - A line from paths.txt (e.g., "SHARADAR/SF1.json -q dimension=MRT -o companies.csv")
 /// 
 /// # Returns
-/// * `Option<(String, Option<HashMap<String, String>>)>` - Path and optional query params
-fn parse_path_line(line: &str) -> Option<(String, Option<HashMap<String, String>>)> {
+/// * `Option<(String, Option<HashMap<String, String>>, Option<String>)>` - Path, optional query params, and optional output filename
+fn parse_path_line(line: &str) -> Option<(String, Option<HashMap<String, String>>, Option<String>)> {
     let line = line.trim();
     
     // Skip empty lines and comments
@@ -167,17 +167,47 @@ fn parse_path_line(line: &str) -> Option<(String, Option<HashMap<String, String>
         return None;
     }
     
-    // Check if line contains -q flag
+    let mut path = line.to_string();
+    let mut query_params: Option<HashMap<String, String>> = None;
+    let mut output_filename: Option<String> = None;
+    
+    // Parse -q flag for query parameters
     if let Some(q_pos) = line.find(" -q ") {
-        let path = line[..q_pos].trim().to_string();
-        let query_str = line[q_pos + 4..].trim(); // Skip " -q "
+        path = line[..q_pos].trim().to_string();
+        let remaining = &line[q_pos + 4..]; // Skip " -q "
         
-        let query_params = parse_query_string(query_str);
-        Some((path, if query_params.is_empty() { None } else { Some(query_params) }))
-    } else {
-        // No query parameters
-        Some((line.to_string(), None))
+        // Check if there's also an -o flag after -q
+        if let Some(o_pos) = remaining.find(" -o ") {
+            let query_str = remaining[..o_pos].trim();
+            let output_str = remaining[o_pos + 4..].trim(); // Skip " -o "
+            
+            if !query_str.is_empty() {
+                let parsed_params = parse_query_string(query_str);
+                query_params = if parsed_params.is_empty() { None } else { Some(parsed_params) };
+            }
+            
+            if !output_str.is_empty() {
+                output_filename = Some(output_str.to_string());
+            }
+        } else {
+            // Only -q flag, no -o flag
+            let query_str = remaining.trim();
+            if !query_str.is_empty() {
+                let parsed_params = parse_query_string(query_str);
+                query_params = if parsed_params.is_empty() { None } else { Some(parsed_params) };
+            }
+        }
+    } else if let Some(o_pos) = line.find(" -o ") {
+        // Only -o flag, no -q flag
+        path = line[..o_pos].trim().to_string();
+        let output_str = line[o_pos + 4..].trim(); // Skip " -o "
+        
+        if !output_str.is_empty() {
+            output_filename = Some(output_str.to_string());
+        }
     }
+    
+    Some((path, query_params, output_filename))
 }
 
 #[derive(Debug)]
@@ -192,6 +222,7 @@ async fn process_single_download(
     api_key: &str,
     path: String,
     query_params: Option<HashMap<String, String>>,
+    custom_output_filename: Option<String>,
 ) -> Result<DownloadResult> {
     let start_time = Instant::now();
     
@@ -199,14 +230,19 @@ async fn process_single_download(
     
     match result {
         Ok(response) => {
-            let base_filename = path.replace('/', "_").replace(".json", "") + "_data";
+            // Use custom filename if provided, otherwise use default naming
+            let filepath = if let Some(custom_filename) = custom_output_filename {
+                format!("{}/{}", OUTPUT_DIR, custom_filename)
+            } else {
+                let base_filename = path.replace('/', "_").replace(".json", "") + "_data";
+                format!("{}/{}.zip", OUTPUT_DIR, base_filename)
+            };
             
-            let zip_filepath = format!("{}/{}.zip", OUTPUT_DIR, base_filename);
-            match save_file(&response.body, &zip_filepath) {
-                Ok(zip_filename) => {
+            match save_file(&response.body, &filepath) {
+                Ok(saved_filename) => {
                     let duration = start_time.elapsed().as_secs_f64();
                     Ok(DownloadResult {
-                        message: format!("✓ {} -> {} ({} bytes, {:.2}s)", path, zip_filename, response.body.len(), duration),
+                        message: format!("✓ {} -> {} ({} bytes, {:.2}s)", path, saved_filename, response.body.len(), duration),
                         duration,
                         success: true,
                     })
@@ -257,10 +293,10 @@ async fn process_all_paths(api_key: &str) -> Result<()> {
     
     // Collect all valid paths and create concurrent tasks
     for line in lines {
-        if let Some((path, query_params)) = parse_path_line(line) {
+        if let Some((path, query_params, output_filename)) = parse_path_line(line) {
             let api_key = api_key.to_string();
             tasks.push(tokio::spawn(async move {
-                process_single_download(&api_key, path, query_params).await
+                process_single_download(&api_key, path, query_params, output_filename).await
             }));
         }
     }
