@@ -12,3 +12,12 @@ anyhow = "1.0"
 zip = "0.6"
 dotenv = "0.15"
 futures = "0.3"
+indicatif = "0.17"
+polars = { version = "0.45", features = ["lazy", "csv", "decompress", "rolling_window", "round_series", "abs", "log", "ewma", "ipc"] }
+limbo = "0.0.22"
+rusqlite = "0.31"
+csv = "1"
+arrow-array = "52"
+arrow-schema = "52"
+arrow-ipc = "52"
+
