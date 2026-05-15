@@ -6,4 +6,3 @@ SHARADAR/INDICATORS.json -q table=SF1,SEP -o indicators.csv.zip
 SHARADAR/METRICS.json -o metrics.csv.zip
 SHARADAR/SF1.json -q dimension=MRT -o financials_ttm.csv.zip
 SHARADAR/SF2.json -o insiders.csv.zip
-SHARADAR/SF3.json -o institutions.csv.zip
