@@ -23,3 +23,4 @@ output/
 # Temporary files
 *_temp.csv
 *.db
+*.duckdb

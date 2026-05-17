@@ -120,7 +120,7 @@ pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
     }
 
     println!("compute_hurst completed in {:.2?}", start.elapsed());
-    Ok(Series::new("hurst".into(), hurst_out).round(2)?)
+    Ok(Series::new("hurst".into(), hurst_out))
 }
 
 pub fn with_hurst(mut df: DataFrame, cfg: HurstConfig) -> PolarsResult<DataFrame> {

@@ -1,13 +1,14 @@
 use anyhow::{Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use polars::prelude::{DataFrame, DataType};
 use std::{
     collections::HashMap,
     env,
     io::{self, Write},
     path::Path,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 mod api;
@@ -20,36 +21,76 @@ use filetools::{ensure_directory, save_file};
 
 const DOWNLOADS_DIR: &str = "downloads";
 const OUTPUT_DIR: &str = "output";
+const PATHS_FILE: &str = "paths.txt";
+const ENV_FILE: &str = ".env";
 
-/// Get user input from stdin with better error handling
-fn get_user_input(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
-    io::stdout()
-        .flush()
-        .map_err(|e| anyhow!("Failed to flush stdout: {}", e))?;
+// ---------------------------------------------------------------------------
+// API key handling
+// ---------------------------------------------------------------------------
 
+/// Prompt the user via stdin and trim the response.
+fn prompt(message: &str) -> Result<String> {
+    print!("{}", message);
+    io::stdout().flush()?;
     let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| anyhow!("Failed to read user input: {}", e))?;
-
+    io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
 }
 
-/// Parse query string in format "key=value&key=value" into HashMap
-fn parse_query_string(query_str: &str) -> HashMap<String, String> {
-    if query_str.is_empty() {
-        return HashMap::new();
+/// Load the NASDAQ API key from .env, or prompt and persist it on first run.
+fn load_or_create_api_key() -> Result<String> {
+    if Path::new(ENV_FILE).exists() {
+        dotenv::dotenv().ok();
+        if let Ok(key) = env::var("NASDAQ_API_KEY") {
+            if !key.is_empty() {
+                return Ok(key);
+            }
+        }
     }
 
-    query_str
-        .split('&')
+    println!("\nNo NASDAQ API key found.");
+    println!("Get one for free at https://data.nasdaq.com/, then paste it below.");
+
+    let key = loop {
+        let entered = prompt("API key: ")?;
+        if !entered.is_empty() {
+            break entered;
+        }
+        println!("Key cannot be empty.");
+    };
+
+    // Persist on first run so the user only has to do this once.
+    let env_content = format!("# NASDAQ API Configuration\nNASDAQ_API_KEY={}\n", key);
+    match std::fs::write(ENV_FILE, env_content) {
+        Ok(_) => println!("✓ Saved to .env (add it to .gitignore to keep it private)"),
+        Err(e) => eprintln!("Warning: could not write .env: {}", e),
+    }
+
+    Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// paths.txt parsing
+// ---------------------------------------------------------------------------
+
+/// A single dataset to download, parsed from a line in paths.txt.
+struct PathSpec {
+    path: String,
+    query: Option<HashMap<String, String>>,
+    output: Option<String>,
+}
+
+/// Parse a `key=value&key=value` query string into a map. Invalid pairs are
+/// skipped with a warning.
+fn parse_query(s: &str) -> HashMap<String, String> {
+    s.split('&')
         .filter_map(|pair| {
             let pair = pair.trim();
             match pair.split_once('=') {
-                Some((key, value)) => Some((key.trim().to_string(), value.trim().to_string())),
+                Some((k, v)) => Some((k.trim().to_string(), v.trim().to_string())),
+                None if pair.is_empty() => None,
                 None => {
-                    eprintln!("Warning: Ignoring invalid query parameter: {}", pair);
+                    eprintln!("Warning: ignoring invalid query parameter: {}", pair);
                     None
                 }
             }
@@ -57,383 +98,333 @@ fn parse_query_string(query_str: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Load or create .env file with NASDAQ API key
-///
-/// # Returns
-/// * `Result<String>` - The NASDAQ API key
-fn load_or_create_api_key() -> Result<String> {
-    let env_file = ".env";
-
-    // Try to load existing .env file
-    if Path::new(env_file).exists() {
-        println!("Loading API key from .env file...");
-        dotenv::dotenv().ok();
-
-        if let Ok(api_key) = env::var("NASDAQ_API_KEY") {
-            if !api_key.is_empty() {
-                println!("✓ API key loaded from .env file");
-                return Ok(api_key);
-            }
-        }
-
-        println!("Warning: .env file exists but NASDAQ_API_KEY is missing or empty");
-    } else {
-        println!("No .env file found");
-    }
-
-    // Prompt user for API key
-    println!("\nNASDAQ API key is required to download data.");
-    println!("You can get a free API key from: https://data.nasdaq.com/");
-
-    let api_key = loop {
-        match get_user_input("\nEnter your NASDAQ API key: ") {
-            Ok(key) if !key.is_empty() => break key,
-            Ok(_) => println!("API key cannot be empty. Please try again."),
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                return Err(e);
-            }
-        }
-    };
-
-    // Ask if user wants to save the API key
-    println!("\nWould you like to save this API key to a .env file for future use? (y/n)");
-    match get_user_input("Save API key: ") {
-        Ok(answer) if answer.to_lowercase().starts_with('y') => {
-            let env_content = format!("# NASDAQ API Configuration\nNASDAQ_API_KEY={}\n", api_key);
-            match std::fs::write(env_file, env_content) {
-                Ok(_) => {
-                    println!("✓ API key saved to .env file");
-                    println!("Note: Add .env to your .gitignore file to keep your API key secure!");
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to save .env file: {}", e);
-                    println!("You'll need to enter your API key each time you run the program.");
-                }
-            }
-        }
-        Ok(_) => {
-            println!("API key not saved. You'll need to enter it each time you run the program.")
-        }
-        Err(e) => eprintln!("Error reading input: {}", e),
-    }
-
-    Ok(api_key)
-}
-
-/// Parse a path line from paths.txt, extracting path, query parameters, and output filename
-///
-/// # Arguments
-/// * `line` - A line from paths.txt (e.g., "SHARADAR/SF1.json -q dimension=MRT -o companies.csv")
-///
-/// # Returns
-/// * `Option<(String, Option<HashMap<String, String>>, Option<String>)>` - Path, optional query params, and optional output filename
-fn parse_path_line(
-    line: &str,
-) -> Option<(String, Option<HashMap<String, String>>, Option<String>)> {
+/// Parse a single paths.txt line. Format: `PATH [-q QUERY] [-o OUTPUT]`.
+/// Flags may appear in any order. Returns `None` for blank lines and comments.
+fn parse_path_line(line: &str) -> Option<PathSpec> {
     let line = line.trim();
-
-    // Skip empty lines and comments
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
 
-    let mut path = line.to_string();
-    let mut query_params: Option<HashMap<String, String>> = None;
-    let mut output_filename: Option<String> = None;
+    // Tokenize on whitespace; first token is the path, remaining tokens are
+    // flag/value pairs. Values are *not* shell-quoted (paths.txt is internal).
+    let mut tokens = line.split_whitespace();
+    let path = tokens.next()?.to_string();
 
-    // Parse -q flag for query parameters
-    if let Some(q_pos) = line.find(" -q ") {
-        path = line[..q_pos].trim().to_string();
-        let remaining = &line[q_pos + 4..]; // Skip " -q "
-
-        // Check if there's also an -o flag after -q
-        if let Some(o_pos) = remaining.find(" -o ") {
-            let query_str = remaining[..o_pos].trim();
-            let output_str = remaining[o_pos + 4..].trim(); // Skip " -o "
-
-            if !query_str.is_empty() {
-                let parsed_params = parse_query_string(query_str);
-                query_params = if parsed_params.is_empty() {
-                    None
-                } else {
-                    Some(parsed_params)
-                };
+    let mut query = None;
+    let mut output = None;
+    while let Some(flag) = tokens.next() {
+        let value = tokens.next().unwrap_or_else(|| {
+            eprintln!("Warning: flag {} in '{}' has no value", flag, line);
+            ""
+        });
+        match flag {
+            "-q" => {
+                let parsed = parse_query(value);
+                query = (!parsed.is_empty()).then_some(parsed);
             }
-
-            if !output_str.is_empty() {
-                output_filename = Some(output_str.to_string());
+            "-o" => {
+                if !value.is_empty() {
+                    output = Some(value.to_string());
+                }
             }
-        } else {
-            // Only -q flag, no -o flag
-            let query_str = remaining.trim();
-            if !query_str.is_empty() {
-                let parsed_params = parse_query_string(query_str);
-                query_params = if parsed_params.is_empty() {
-                    None
-                } else {
-                    Some(parsed_params)
-                };
-            }
-        }
-    } else if let Some(o_pos) = line.find(" -o ") {
-        // Only -o flag, no -q flag
-        path = line[..o_pos].trim().to_string();
-        let output_str = line[o_pos + 4..].trim(); // Skip " -o "
-
-        if !output_str.is_empty() {
-            output_filename = Some(output_str.to_string());
+            other => eprintln!("Warning: unknown flag '{}' in '{}'", other, line),
         }
     }
 
-    Some((path, query_params, output_filename))
+    Some(PathSpec {
+        path,
+        query,
+        output,
+    })
 }
 
-/// Process a single path download and persist the response body.
-///
-/// Returns `true` on success and `false` when download or save fails.
-async fn process_single_download(
-    api_key: &str,
-    path: String,
-    query_params: Option<HashMap<String, String>>,
-    custom_output_filename: Option<String>,
-) -> bool {
-    let response = match nasdaq_api_get(&path, api_key, query_params).await {
-        Ok(response) => response,
+// ---------------------------------------------------------------------------
+// Downloader
+// ---------------------------------------------------------------------------
+
+/// Download a single dataset and write the response body to disk.
+async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
+    let PathSpec {
+        path,
+        query,
+        output,
+    } = spec;
+
+    let response = match nasdaq_api_get(&path, &api_key, query).await {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("✗ {} -> Download failed: {}", path, e);
+            eprintln!("✗ {} -> download failed: {}", path, e);
             return false;
         }
     };
 
-    // Use custom filename if provided, otherwise use default naming.
-    let filepath = if let Some(custom_filename) = custom_output_filename {
-        format!("{}/{}", DOWNLOADS_DIR, custom_filename)
-    } else {
-        let base_filename = path.replace('/', "_").replace(".json", "") + "_data";
-        format!("{}/{}.zip", DOWNLOADS_DIR, base_filename)
+    let filepath = match output {
+        Some(name) => format!("{}/{}", DOWNLOADS_DIR, name),
+        None => {
+            let base = path.replace('/', "_").replace(".json", "") + "_data";
+            format!("{}/{}.zip", DOWNLOADS_DIR, base)
+        }
     };
 
     if let Err(e) = save_file(&response.body, &filepath) {
-        eprintln!("✗ {} -> Save failed: {}", path, e);
+        eprintln!("✗ {} -> save failed: {}", path, e);
         return false;
     }
-
     true
 }
 
-/// Process all paths from paths.txt file concurrently
-///
-/// # Arguments
-/// * `api_key` - The NASDAQ API key
-///
-/// # Returns
-/// * `Result<()>` - Success or error
-async fn process_all_paths(api_key: &str) -> Result<()> {
-    let batch_start_time = Instant::now();
+/// Read paths.txt, parse it, and download every entry concurrently.
+async fn run_downloader(api_key: &str) -> Result<()> {
+    let start = Instant::now();
+    println!("=== NASDAQ Data Downloader ===");
 
-    println!("\n=== Processing All Paths from paths.txt (Concurrent Mode) ===");
+    let paths_content = std::fs::read_to_string(PATHS_FILE).map_err(|e| {
+        anyhow!(
+            "Failed to read {}: {}. Create it with one entry per line, e.g.:\n  SHARADAR/SF1.json -q dimension=MRT -o financials.csv",
+            PATHS_FILE,
+            e
+        )
+    })?;
 
-    // Read the paths.txt file
-    let paths_content = match std::fs::read_to_string("paths.txt") {
-        Ok(content) => content,
-        Err(e) => {
-            return Err(anyhow!(
-                "Failed to read paths.txt file: {}. Make sure the file exists.",
-                e
-            ));
-        }
-    };
-
-    let shared_api_key: Arc<str> = Arc::from(api_key);
-    let mut pending_tasks = FuturesUnordered::new();
-
-    // Collect all valid paths and create concurrent tasks.
-    for line in paths_content.lines() {
-        if let Some((path, query_params, output_filename)) = parse_path_line(line) {
-            let api_key = Arc::clone(&shared_api_key);
-            pending_tasks.push(tokio::spawn(async move {
-                process_single_download(api_key.as_ref(), path, query_params, output_filename).await
-            }));
-        }
+    let specs: Vec<PathSpec> = paths_content.lines().filter_map(parse_path_line).collect();
+    if specs.is_empty() {
+        return Err(anyhow!(
+            "{} contained no valid entries (only blank lines or comments).",
+            PATHS_FILE
+        ));
     }
 
-    let total_tasks = pending_tasks.len();
-    println!("Starting {} concurrent downloads...", total_tasks);
+    let shared_key: Arc<str> = Arc::from(api_key);
+    let mut tasks: FuturesUnordered<_> = specs
+        .into_iter()
+        .map(|spec| {
+            let key = Arc::clone(&shared_key);
+            tokio::spawn(download_one(key, spec))
+        })
+        .collect();
 
-    // Create progress bar for NASDAQ downloads
-    let nasdaq_pb = ProgressBar::new(total_tasks as u64);
-    nasdaq_pb.set_style(
+    let total = tasks.len();
+    println!("Starting {} concurrent downloads...", total);
+
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
         ProgressStyle::default_bar()
             .template("{bar:40.cyan/blue} {pos}/{len} {msg}")
-            .expect("Failed to set progress bar template")
+            .expect("invalid progress bar template")
             .progress_chars("#>-"),
     );
-    nasdaq_pb.set_message("NASDAQ datasets");
+    pb.set_message("downloads");
 
-    let mut success_count = 0;
-    let mut failed_count = 0;
-    // Process task results as they complete (avoids storing all results in memory).
-    while let Some(result) = pending_tasks.next().await {
+    let (mut ok, mut fail) = (0_usize, 0_usize);
+    while let Some(result) = tasks.next().await {
         match result {
-            Ok(true) => success_count += 1,
-            Ok(false) | Err(_) => failed_count += 1,
+            Ok(true) => ok += 1,
+            Ok(false) | Err(_) => fail += 1,
         }
-        nasdaq_pb.inc(1);
+        pb.inc(1);
     }
-    nasdaq_pb.finish_with_message("NASDAQ downloads completed!");
+    pb.finish_with_message("done");
 
-    let batch_duration = batch_start_time.elapsed();
-    let total_processed = success_count + failed_count;
+    println!(
+        "\nDownloaded {}/{} in {:.2}s ({} failed)",
+        ok,
+        total,
+        start.elapsed().as_secs_f64(),
+        fail
+    );
 
-    println!("\n=== Concurrent Processing Complete ===");
-    println!("Total processed: {} paths", total_processed);
-    println!("Successful: {} downloads", success_count);
-    println!("Failed: {} downloads", failed_count);
-    println!("Total time: {:.2} seconds", batch_duration.as_secs_f64());
-
-    Ok(())
-}
-
-async fn downloader() -> Result<()> {
-    println!("=== NASDAQ Data Downloader ===");
-    println!("This tool downloads data from NASDAQ's API.\n");
-    // Ensure required directories exist
-    ensure_directory(DOWNLOADS_DIR)?;
-    ensure_directory(OUTPUT_DIR)?;
-
-    // Load API key from .env file or prompt user
-    let api_key = load_or_create_api_key()?;
-
-    // Check if paths.txt exists and choose mode accordingly
-    if Path::new("paths.txt").exists() {
-        println!("Found paths.txt file. Processing all paths in batch mode...");
-        process_all_paths(&api_key).await?;
+    if fail > 0 {
+        Err(anyhow!("{} downloads failed", fail))
     } else {
-        println!("No paths.txt file found. Using interactive mode...");
-        process_single_path(&api_key).await?;
+        Ok(())
     }
+}
 
+// ---------------------------------------------------------------------------
+// Writer (sync — no concurrent work, runs on the calling thread)
+// ---------------------------------------------------------------------------
+
+/// Run a closure while displaying an animated spinner with `label`. When the
+/// closure returns, the spinner is cleared and replaced by a one-line summary
+/// (`✓ label (1.23s)` on success, `✗ label` on error).
+///
+/// The spinner runs on its own thread via `enable_steady_tick`, redrawing at
+/// 80ms intervals — negligible CPU cost. Any `println!` output from inside
+/// the closure scrolls cleanly above the spinner line.
+fn with_spinner<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .expect("invalid spinner template"),
+    );
+    pb.set_message(label.to_string());
+    pb.enable_steady_tick(Duration::from_millis(80));
+
+    let start = Instant::now();
+    match work() {
+        Ok(value) => {
+            pb.finish_and_clear();
+            println!("✓ {} ({:.2}s)", label, start.elapsed().as_secs_f64());
+            Ok(value)
+        }
+        Err(e) => {
+            pb.finish_and_clear();
+            println!("✗ {}", label);
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer pipeline
+//
+// Each `write_*` function owns the full lifecycle for one data domain: load
+// the CSV, transform it, write to DuckDB. Functions that produce data used
+// downstream return the relevant DataFrame; terminal functions return ().
+// `run_writer` is the thin orchestrator that wires them together.
+// ---------------------------------------------------------------------------
+
+/// Load → adjust → indicators → write stocks (daily and weekly).
+/// Returns the daily indicators frame because `write_companies` needs it for
+/// the latest-snapshot join.
+fn write_stocks() -> Result<DataFrame> {
+    use dataframetools::*;
+
+    // Pin the 6 numeric columns at parse time to skip inference for them on
+    // a 45M-row file. `date` is left as String here and cast to Date inside
+    // `adjust_prices` so downstream temporal ops (resample) work.
+    let raw = with_spinner("loading raw prices", || {
+        load_csv_zip(
+            &format!("{}/stocks_eod.csv.zip", DOWNLOADS_DIR),
+            Some(&[
+                ("open", DataType::Float64),
+                ("high", DataType::Float64),
+                ("low", DataType::Float64),
+                ("close", DataType::Float64),
+                ("closeadj", DataType::Float64),
+                ("volume", DataType::Float64),
+            ]),
+        )
+    })?;
+    let adjusted = with_spinner("adjusting prices", || adjust_prices(raw))?;
+
+    // Daily pipeline: Hurst at 500-bar (~2y) window, then daily indicators.
+    let daily_hurst_cfg = fractaltools::HurstConfig::default(); // window=500, vol_window=20
+    let daily_with_hurst = with_spinner("computing daily hurst", || {
+        fractaltools::with_hurst(adjusted.clone(), daily_hurst_cfg).map_err(anyhow::Error::from)
+    })?;
+    let stocks_daily = with_spinner("computing daily indicators", || {
+        technical_indicators_daily(daily_with_hurst)
+    })?;
+    with_spinner("writing stocks_daily to duckdb", || {
+        df_to_duckdb(&stocks_daily, "stocks_daily")
+    })?;
+
+    // Weekly pipeline: resample on adjusted daily bars (correct order —
+    // aggregating unadjusted bars then adjusting after would produce
+    // incoherent intrabar ranges), Hurst at 100-bar (~2y of weeks) window,
+    // then weekly indicators.
+    let weekly_bars = with_spinner("resampling to weekly", || resample(adjusted, "1w"))?;
+    let weekly_hurst_cfg = fractaltools::HurstConfig {
+        window: 100,   // ~2 years of weekly bars
+        vol_window: 4, // ~1 month
+        ..Default::default()
+    };
+    let weekly_with_hurst = with_spinner("computing weekly hurst", || {
+        fractaltools::with_hurst(weekly_bars, weekly_hurst_cfg).map_err(anyhow::Error::from)
+    })?;
+    let stocks_weekly = with_spinner("computing weekly indicators", || {
+        technical_indicators_weekly(weekly_with_hurst)
+    })?;
+    with_spinner("writing stocks_weekly to duckdb", || {
+        df_to_duckdb(&stocks_weekly, "stocks_weekly")
+    })?;
+
+    Ok(stocks_daily)
+}
+
+/// Load → adjust → write fundamentals. Returns the adjusted frame because
+/// `write_companies` needs it for the latest-snapshot join.
+fn write_financials() -> Result<DataFrame> {
+    use dataframetools::*;
+
+    let raw = with_spinner("loading raw fundamentals", || {
+        load_csv_zip(&format!("{}/financials_ttm.csv.zip", DOWNLOADS_DIR), None)
+    })?;
+    let financials_ttm = with_spinner("adjusting fundamentals", || adjust_fundamentals(raw))?;
+    with_spinner("writing financials_ttm to duckdb", || {
+        df_to_duckdb(&financials_ttm, "financials_ttm")
+    })?;
+    Ok(financials_ttm)
+}
+
+/// Load → filter → join → write the company snapshot. Joins metadata with
+/// the latest fundamentals and latest daily prices per ticker; computes
+/// `rs1y` percentile rank, `marketcap`, and `ev` in the process.
+fn write_companies(financials_ttm: DataFrame, stocks_daily: DataFrame) -> Result<()> {
+    use dataframetools::*;
+
+    let raw = with_spinner("loading raw companies metadata", || {
+        load_csv_zip(&format!("{}/companies.csv.zip", DOWNLOADS_DIR), None)
+    })?;
+    let meta = with_spinner("filtering companies metadata", || {
+        filter_companies_meta(raw)
+    })?;
+    let companies = with_spinner("joining company snapshot", || {
+        join_company_financials(financials_ttm, meta, stocks_daily)
+    })?;
+    with_spinner("writing companies to duckdb", || {
+        df_to_duckdb(&companies, "companies")
+    })?;
     Ok(())
 }
 
-async fn writer() -> Result<()> {
-    let stock_prices =
-        dataframetools::adjust_prices(&format!("{}/stocks_eod.csv.zip", DOWNLOADS_DIR))?;
-    let stock_prices = dataframetools::technical_indicators(stock_prices)?;
-    dataframetools::write_df_to_duckdb(stock_prices, "stock_prices").await?;
-    let financials_ttm =
-        dataframetools::adjust_fundamentals(&format!("{}/financials_ttm.csv.zip", DOWNLOADS_DIR))?;
-    let financials_ttm =
-        dataframetools::write_df_to_duckdb(financials_ttm, "financials_ttm").await?;
-    let companies_meta =
-        dataframetools::load_companies_meta(&format!("{}/companies.csv.zip", DOWNLOADS_DIR))?;
-    let companies = dataframetools::join_company_financials(financials_ttm, companies_meta)?;
-    dataframetools::write_df_to_duckdb(companies, "companies").await?;
-    let insiders = dataframetools::update_insiders(&format!("{}/insiders.csv.zip", DOWNLOADS_DIR))?;
-    dataframetools::write_df_to_duckdb(insiders, "insiders").await?;
+/// Load → transform → write insider transactions. Self-contained, no
+/// downstream consumers. `formtype` starts with numeric codes ("4", "5")
+/// and then hits strings like "RESTATED - 4" hundreds of rows in, so
+/// default inference picks Int64 and crashes mid-file. Pin to String at
+/// load time.
+fn write_insiders() -> Result<()> {
+    use dataframetools::*;
+
+    let raw = with_spinner("loading raw insider transactions", || {
+        load_csv_zip(
+            &format!("{}/insiders.csv.zip", DOWNLOADS_DIR),
+            Some(&[("formtype", DataType::String)]),
+        )
+    })?;
+    let insiders = with_spinner("transforming insider transactions", || update_insiders(raw))?;
+    with_spinner("writing insiders to duckdb", || {
+        df_to_duckdb(&insiders, "insiders")
+    })?;
     Ok(())
 }
+
+fn run_writer() -> Result<()> {
+    let stocks_daily = write_stocks()?;
+    let financials_ttm = write_financials()?;
+    write_companies(financials_ttm, stocks_daily)?;
+    write_insiders()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    ensure_directory(DOWNLOADS_DIR)?;
+    ensure_directory(OUTPUT_DIR)?;
+
+    // --sync skips the downloader and just rebuilds DuckDB from cached files.
     if env::args().skip(1).any(|arg| arg == "--sync") {
-        return writer().await;
+        return run_writer();
     }
 
-    downloader().await?;
-    writer().await
-}
-
-/// Process a single path interactively
-async fn process_single_path(api_key: &str) -> Result<()> {
-    // Get dataset path from user
-    let path = loop {
-        println!("\nEnter the dataset path (e.g., 'WIKI/PRICES', 'ZACKS/FC', 'EOD/AAPL'):");
-        match get_user_input("Path: ") {
-            Ok(p) if !p.is_empty() => break p,
-            Ok(_) => println!("Path cannot be empty. Please try again."),
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                return Err(e);
-            }
-        }
-    };
-
-    // Get query parameters from user
-    println!("\nEnter additional query parameters (optional):");
-    println!("Format: key=value&key=value (e.g., 'ticker=AAPL&date.gte=2023-01-01')");
-    let query_input = match get_user_input("Query params (or press Enter to skip): ") {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            return Err(e);
-        }
-    };
-
-    let query_params = if query_input.is_empty() {
-        None
-    } else {
-        let parsed = parse_query_string(&query_input);
-        if parsed.is_empty() {
-            println!("No valid query parameters found.");
-            None
-        } else {
-            println!("Parsed query parameters: {:?}", parsed);
-            Some(parsed)
-        }
-    };
-
-    println!("\n=== Making NASDAQ API Request ===");
-    println!("Path: {}", path);
-    if let Some(ref params) = query_params {
-        println!("Query params: {:?}", params);
-    }
-    println!("");
-
-    let request_start_time = Instant::now();
-
-    // Make the NASDAQ API request
-    match nasdaq_api_get(&path, api_key, query_params).await {
-        Ok(response) => {
-            let download_time = request_start_time.elapsed();
-            println!("✓ Success!");
-            println!("Status Code: {}", response.status_code);
-            println!("Data size: {} bytes", response.body.len());
-            println!("Download time: {:.2} seconds", download_time.as_secs_f64());
-
-            // Automatically save the zip file
-            let base_filename = format!("{}_data", path.replace('/', "_"));
-
-            let zip_filepath = format!("{}/{}.zip", DOWNLOADS_DIR, base_filename);
-            match save_file(&response.body, &zip_filepath) {
-                Ok(zip_filename) => {
-                    let total_time = request_start_time.elapsed();
-                    println!("✓ Zip file saved to: {}", zip_filename);
-                    println!(
-                        "Total processing time: {:.2} seconds",
-                        total_time.as_secs_f64()
-                    );
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to save zip file: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            let failed_time = request_start_time.elapsed();
-            eprintln!(
-                "✗ NASDAQ API request failed (took {:.2}s): {}",
-                failed_time.as_secs_f64(),
-                e
-            );
-            println!("\nTroubleshooting tips:");
-            println!("1. Check your API key is valid");
-            println!("2. Verify the dataset path exists");
-            println!("3. Check your query parameters are correct");
-            println!("4. Ensure you have sufficient API quota");
-        }
-    }
-
-    Ok(())
+    let api_key = load_or_create_api_key()?;
+    run_downloader(&api_key).await?;
+    run_writer()
 }
