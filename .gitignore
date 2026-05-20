@@ -24,3 +24,4 @@ output/
 *_temp.csv
 *.db
 *.duckdb
+*.parquet

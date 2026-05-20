@@ -75,7 +75,7 @@ impl Default for HurstConfig {
 /// integer-vs-float semantics) to live in the caller, which has the context
 /// to make them.
 pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
-    println!("compute_hurst...");
+    // println!("compute_hurst...");
     let start = Instant::now();
     let n_rows = df.height();
     if n_rows == 0 {
@@ -119,7 +119,7 @@ pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
         }
     }
 
-    println!("compute_hurst completed in {:.2?}", start.elapsed());
+    // println!("compute_hurst completed in {:.2?}", start.elapsed());
     Ok(Series::new("hurst".into(), hurst_out))
 }
 
