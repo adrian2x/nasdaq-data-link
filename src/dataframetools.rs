@@ -1,115 +1,4 @@
-use ::zip::ZipArchive;
-use anyhow::{Result, anyhow};
 use polars::prelude::*;
-use std::fs::File;
-use std::io::copy;
-use std::path::Path;
-
-const OUTPUT_DIR: &str = "output";
-
-/// Stream a CSV file to a Parquet file.
-///
-/// `csv_path`     — path to a plain (unzipped) CSV.
-/// `parquet_path` — path to write the Parquet output to.
-/// `schema_overrides` — columns pinned to known dtypes at parse time; all
-///                      other columns are inferred.
-///
-/// The frame is never collected: `sink_parquet` streams the scan in batches,
-/// so peak memory is one batch regardless of total file size.
-///
-/// Re-runs overwrite in place — `File::create` truncates any existing file;
-/// nothing is deleted.
-pub fn csv_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
-    csv_path: P,
-    parquet_path: Q,
-    schema_overrides: Option<&[(&str, DataType)]>,
-) -> Result<()> {
-    // Parse-time dtype schema: only the named columns are pinned.
-    let overrides_schema = schema_overrides.map(|pairs| {
-        let fields = pairs
-            .iter()
-            .map(|(name, dtype)| Field::new((*name).into(), dtype.clone()));
-        Arc::new(Schema::from_iter(fields))
-    });
-
-    let lf = LazyCsvReader::new(csv_path.as_ref())
-        .with_has_header(true)
-        // Pins the named columns during parsing; no post-parse cast pass.
-        .with_dtype_overwrite(overrides_schema)
-        .finish()?;
-
-    // Streaming sink: a plain projection/cast scan has no `.over()` chains,
-    // so the streaming engine handles this plan and memory stays flat
-    // regardless of how large the CSV is.
-    //
-    // Polars 0.46 `sink_parquet` signature: (path, ParquetWriteOptions,
-    // Option<CloudOptions>). The path param is `&dyn AsRef<Path>` — a trait
-    // object reference — so `parquet_path` is passed by reference (`&`).
-    lf.sink_parquet(&parquet_path, ParquetWriteOptions::default(), None)?;
-
-    Ok(())
-}
-
-/// Extract the first entry of a zip to a file alongside it (suffix stripped),
-/// e.g. `foo.csv.zip` -> `foo.csv`. Returns the extracted path.
-///
-/// `File::create` truncates, so re-runs overwrite the extracted file.
-pub fn extract_zip_file<P: AsRef<Path>>(zip_path: P) -> Result<String> {
-    let zip_path = zip_path.as_ref();
-    let zip_str = zip_path.to_string_lossy();
-    let output_filename = zip_str
-        .strip_suffix(".zip")
-        .map(str::to_string)
-        .unwrap_or_else(|| zip_str.to_string());
-
-    let zip_file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(zip_file)?;
-    let mut csv_file = archive.by_index(0)?;
-    let mut output_file = File::create(&output_filename)?;
-    copy(&mut csv_file, &mut output_file)?;
-    Ok(output_filename)
-}
-
-/// Collect a LazyFrame, write it as parquet, and register it as a DuckDB table.
-///
-/// Streaming sink isn't viable in Polars 0.46 for our heavy `.over()` chains
-/// (the streaming engine doesn't support those plan shapes yet), so we
-/// materialize and write. Everything upstream stays lazy so the optimizer
-/// sees the full pipeline; only this final step is eager.
-pub fn lf_to_duckdb(lf: LazyFrame, table: &str) -> Result<()> {
-    let table = table.trim();
-    if table.is_empty() {
-        return Err(anyhow!("table name cannot be empty"));
-    }
-
-    std::fs::create_dir_all(OUTPUT_DIR)?;
-    let parquet_path = format!("{OUTPUT_DIR}/{table}.parquet");
-
-    if std::env::var("EXPLAIN_PLAN").is_ok() {
-        eprintln!("=== plan for {table} ===");
-        eprintln!("{}", lf.clone().explain(true)?);
-        eprintln!("=== end plan ===");
-    }
-
-    let mut df = lf.collect()?;
-    ParquetWriter::new(File::create(&parquet_path)?).finish(&mut df)?;
-
-    let qt = quote_ident(table);
-    crate::sqltools::execute_sql(
-        &format!("create_{table}"),
-        &format!("CREATE OR REPLACE TABLE {qt} AS SELECT * FROM read_parquet('{parquet_path}');"),
-    )?;
-
-    Ok(())
-}
-
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('\"', "\"\""))
-}
-
-// ---------------------------------------------------------------------------
-// Expression building blocks
-// ---------------------------------------------------------------------------
 
 fn rolling_opts(window: usize) -> RollingOptionsFixedWindow {
     RollingOptionsFixedWindow {
@@ -119,18 +8,16 @@ fn rolling_opts(window: usize) -> RollingOptionsFixedWindow {
     }
 }
 
-/// Shorthand: reference a column cast to Float64 for safe arithmetic.
 fn f(name: &str) -> Expr {
     col(name).cast(DataType::Float64)
 }
 
-/// SMA expression. Caller handles grouping (e.g. `.over([col("ticker")])`).
+/// Simple moving average expression.
 pub fn sma_expr(source: &str, period: usize) -> Expr {
     f(source).rolling_mean(rolling_opts(period))
 }
 
-/// Span-based EMA expression (α = 2/(span+1)). Caller handles grouping.
-/// Distinct from `wilder_smooth` which uses α = 1/n.
+/// Exponential moving average expression using span-based alpha.
 pub fn ema_expr(source: &str, span: usize) -> Expr {
     f(source).ewm_mean(EWMOptions {
         alpha: 2.0 / (span as f64 + 1.0),
@@ -139,20 +26,18 @@ pub fn ema_expr(source: &str, span: usize) -> Expr {
     })
 }
 
-/// Percentage-change expression. ((current / prev) - 1) * 100.
+/// Percent change over `period` rows.
 pub fn chg_expr(source: Expr, period: i64) -> Expr {
     ((source.clone() / source.shift(lit(period))) - lit(1.0)) * lit(100.0)
 }
 
-/// CAGR expression. Compounded growth over `periods` annual periods
-/// (shift looks back periods*4 rows, assuming quarterly data).
+/// CAGR assuming quarterly cadence (`periods * 4` row shift).
 pub fn cagr_expr(source: Expr, periods: i64) -> Expr {
     ((source.clone() / source.shift(lit(periods * 4))).pow(lit(1.0 / periods as f64)) - lit(1.0))
         * lit(100.0)
 }
 
-/// Realized volatility expression. Annualized population std of a log-return
-/// series, returned as a percentage.
+/// Annualized realized volatility from log returns.
 pub fn rv_expr(log_ret_col: &str, window: usize, trading_periods: usize) -> Expr {
     let log_ret = col(log_ret_col);
     let mean = log_ret.clone().rolling_mean(rolling_opts(window));
@@ -161,8 +46,6 @@ pub fn rv_expr(log_ret_col: &str, window: usize, trading_periods: usize) -> Expr
     pop_std * lit((trading_periods as f64).sqrt()) * lit(100.0)
 }
 
-/// Wilder's smoothing: α = 1/period EMA. Used by RSI, ATR, ADX.
-/// Distinct from `ema_expr` (which uses span-based α = 2/(span+1)).
 fn wilder_smooth(source: Expr, period: usize) -> Expr {
     source.ewm_mean(EWMOptions {
         alpha: 1.0 / period as f64,
@@ -171,26 +54,22 @@ fn wilder_smooth(source: Expr, period: usize) -> Expr {
     })
 }
 
-/// MACD line expression: EMA(close, fast) − EMA(close, slow). Caller groups.
 pub fn macd_line_expr(fast: usize, slow: usize) -> Expr {
     ema_expr("close", fast) - ema_expr("close", slow)
 }
 
-/// Bollinger upper band expression. Caller groups.
 pub fn bbtop_expr(period: usize, multiplier: f64) -> Expr {
     let sma = f("close").rolling_mean(rolling_opts(period));
     let stdev = f("close").rolling_std(rolling_opts(period));
     sma + lit(multiplier) * stdev
 }
 
-/// Bollinger lower band expression. Caller groups.
 pub fn bbbot_expr(period: usize, multiplier: f64) -> Expr {
     let sma = f("close").rolling_mean(rolling_opts(period));
     let stdev = f("close").rolling_std(rolling_opts(period));
     sma - lit(multiplier) * stdev
 }
 
-/// True Range expression. Composable for ad-hoc use.
 pub fn true_range_expr() -> Expr {
     let prev_close = f("close").shift(lit(1));
     let hl = f("high") - f("low");
@@ -202,20 +81,7 @@ pub fn true_range_expr() -> Expr {
         .otherwise(lc)
 }
 
-// ---------------------------------------------------------------------------
-// Lazy indicator helpers
-//
-// Each `with_*` takes a LazyFrame, appends the indicator columns, and returns
-// the LazyFrame. They never collect — the optimizer sees the full pipeline
-// and fuses redundant per-ticker partitioning across expressions.
-//
-// Wilder-smoothed indicators (RSI, ATR, ADX) use a hoisted-ternary pattern:
-// inputs to `when().then().otherwise()` are materialized as flat per-ticker
-// columns in a setup wave, so the ternaries themselves don't run under
-// `.over()` (which would trigger expensive list aggregation). Each function
-// is self-contained — call any subset, in any order.
-// ---------------------------------------------------------------------------
-
+/// Add MACD columns.
 pub fn with_macd(lf: LazyFrame, fast: usize, slow: usize, signal: usize) -> LazyFrame {
     let is_default = fast == 12 && slow == 26 && signal == 9;
     let (ema_fast_col, ema_slow_col, macd_col, signal_col) = if is_default {
@@ -234,9 +100,7 @@ pub fn with_macd(lf: LazyFrame, fast: usize, slow: usize, signal: usize) -> Lazy
         )
     };
 
-    // Two waves: signal line references the just-created macd column by name,
-    // and ewm_mean over a freshly-created column isn't reliable in a single
-    // with_columns wave.
+    // Signal is computed in a second wave because it depends on `macd_col`.
     lf.with_columns([
         ema_expr("close", fast)
             .over([col("ticker")])
@@ -253,6 +117,7 @@ pub fn with_macd(lf: LazyFrame, fast: usize, slow: usize, signal: usize) -> Lazy
         .alias(signal_col.as_str())])
 }
 
+/// Add Bollinger band columns.
 pub fn with_bollinger(lf: LazyFrame, period: usize, multiplier: f64) -> LazyFrame {
     let is_default = period == 20 && (multiplier - 2.0).abs() < 1e-9;
     let (top_col, bot_col) = if is_default {
@@ -279,6 +144,7 @@ pub fn with_bollinger(lf: LazyFrame, period: usize, multiplier: f64) -> LazyFram
     ])
 }
 
+/// Add RSI column.
 pub fn with_rsi(lf: LazyFrame, period: usize) -> LazyFrame {
     let rsi_col = format!("rsi{period}");
 
@@ -309,6 +175,7 @@ pub fn with_rsi(lf: LazyFrame, period: usize) -> LazyFrame {
         .drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
 }
 
+/// Add ATR column.
 pub fn with_atr(lf: LazyFrame, period: usize) -> LazyFrame {
     let atr_col = format!("atr{period}");
 
@@ -332,6 +199,7 @@ pub fn with_atr(lf: LazyFrame, period: usize) -> LazyFrame {
         .drop(["_prev_close", "_tr"])
 }
 
+/// Add ADX column.
 pub fn with_adx(lf: LazyFrame, period: usize) -> LazyFrame {
     let adx_col = format!("adx{period}");
 
@@ -412,15 +280,9 @@ pub fn with_adx(lf: LazyFrame, period: usize) -> LazyFrame {
     ])
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline stages — all return LazyFrame
-// ---------------------------------------------------------------------------
-
-/// Apply close-adjustment to OHLC and clean up the prices frame.
-///
-/// Collapsed into a single `select` so the optimizer sees the full final
-/// shape immediately — columns we drop never get parsed.
+/// Adjust raw OHLC values using `closeadj / close`.
 pub fn adjust_prices(lf: LazyFrame) -> LazyFrame {
+    // Keep only adjusted OHLCV columns used downstream.
     let adjustment_factor =
         col("closeadj").cast(DataType::Float64) / col("close").cast(DataType::Float64);
 
@@ -435,16 +297,9 @@ pub fn adjust_prices(lf: LazyFrame) -> LazyFrame {
     ])
 }
 
-/// Resample OHLCV bars to a coarser interval, per ticker.
-///
-/// `interval` follows Polars duration syntax: `"1w"`, `"1mo"`, `"1q"`, etc.
-/// Output `date` is the left edge of each period.
-///
-/// Expects columns: ticker, date (Date dtype), open, high, low, close, volume.
-/// Other columns are silently dropped — applying close-of-period semantics to
-/// derived columns (Hurst, technical indicators) would produce silently wrong
-/// values. Compute indicators on resampled bars downstream, not before.
+/// Resample OHLCV bars at `interval` per ticker.
 pub fn resample(lf: LazyFrame, interval: &str) -> LazyFrame {
+    // Aggregate OHLCV per ticker on a dynamic time window.
     lf.group_by_dynamic(
         col("date"),
         [col("ticker")],
@@ -469,7 +324,7 @@ pub fn resample(lf: LazyFrame, interval: &str) -> LazyFrame {
     .sort(["ticker", "date"], Default::default())
 }
 
-/// Transform raw fundamentals into the analytical schema.
+/// Transform raw fundamentals into analysis columns.
 pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
     lf.with_columns([col("calendardate").cast(DataType::Date)])
         .drop(["dimension", "lastupdated"])
@@ -497,7 +352,6 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
             (lit(100.0) * f("ebitda") / f("revenue")).alias("ebitdamargin"),
             (lit(100.0) * f("ebit") / f("revenue")).alias("ebitmargin"),
         ])
-        // Depends on the previous wave by alias name.
         .with_columns([
             (f("debt") / f("equity")).alias("de"),
             (f("netincadj") / f("shares")).alias("epsadj"),
@@ -505,7 +359,7 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
             (lit(100.0) * f("shreturnusd") / f("marketcap")).alias("shyield"),
         ])
         .sort(["ticker", "calendardate"], Default::default())
-        // fcfadj uses .shift() so must run after the sort.
+        // `shift`-based metrics require sorted time order.
         .with_columns({
             let fcfadj = (f("ncfo")
                 - f("netincdis")
@@ -518,8 +372,6 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
                 (fcfadj / f("shares")).alias("fcfpsadj"),
             ]
         })
-        // Growth metrics. Revenue/EBITDA growth are per-share so buybacks
-        // and issuances are reflected. epsadj/fcfpsadj are already per-share.
         .with_columns([
             chg_expr(f("revenue") / f("shares"), 4)
                 .over([col("ticker")])
@@ -560,8 +412,7 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
         ])
 }
 
-/// Transform raw insider transactions: per-(ticker, date, person) summary
-/// filtered to the last 6 months.
+/// Aggregate insider transactions over the last ~6 months.
 pub fn update_insiders(lf: LazyFrame) -> LazyFrame {
     let six_months_ago = chrono::Utc::now().date_naive() - chrono::Duration::weeks(26);
 
@@ -614,20 +465,7 @@ pub fn update_insiders(lf: LazyFrame) -> LazyFrame {
         .alias("officertitle")])
 }
 
-/// Compute the full daily indicator set on a daily-bars price LazyFrame.
-///
-/// Hurst must be applied upstream (via `fractaltools::with_hurst`).
-///
-/// Daily-specific conventions:
-///   - SMA/EMA at 5/10/20/50/100/150/200 daily bars
-///   - ROC at 1d, 5d, 20d, 63d, 126d, 189d, 252d
-///   - RV at 5/20/63/252 bars (annualized using 252 trading periods)
-///   - avgvolume3m (50-bar SMA of volume)
-///   - max1y/min1y (250-bar rolling extrema)
-///   - rs1y (weighted composite of roc1q/2q/3q/1y)
-///
-/// Timeframe-invariant: MACD(12,26,9), Bollinger(20,2), RSI(14), ATR(14),
-/// ADX(14).
+/// Compute daily technical indicator columns.
 pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     let range_opts = RollingOptionsFixedWindow {
         window_size: 250,
@@ -653,39 +491,55 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
                 .over([col("ticker")])
                 .alias("avgvolume3m"),
             (f("close") / f("close").shift(lit(1)))
-            .log(std::f64::consts::E)
-            .over([col("ticker")])
-            .alias("log_ret"),])
+                .log(std::f64::consts::E)
+                .over([col("ticker")])
+                .alias("log_ret"),
+        ])
         .with_columns([
-            chg_expr(f("close"), 1).over([col("ticker")]).alias("pct").cast(DataType::Float32),
-            chg_expr(f("close"), 5).over([col("ticker")]).alias("pct1w").cast(DataType::Float32),
+            chg_expr(f("close"), 1)
+                .over([col("ticker")])
+                .alias("pct")
+                .cast(DataType::Float32),
+            chg_expr(f("close"), 5)
+                .over([col("ticker")])
+                .alias("pct1w")
+                .cast(DataType::Float32),
             chg_expr(f("close"), 20)
                 .over([col("ticker")])
-                .alias("pct1m").cast(DataType::Float32),
+                .alias("pct1m")
+                .cast(DataType::Float32),
             chg_expr(f("close"), 3 * 21)
                 .over([col("ticker")])
-                .alias("pct1q").cast(DataType::Float32),
+                .alias("pct1q")
+                .cast(DataType::Float32),
             chg_expr(f("close"), 6 * 21)
                 .over([col("ticker")])
-                .alias("pct2q").cast(DataType::Float32),
+                .alias("pct2q")
+                .cast(DataType::Float32),
             chg_expr(f("close"), 9 * 21)
                 .over([col("ticker")])
-                .alias("pct3q").cast(DataType::Float32),
+                .alias("pct3q")
+                .cast(DataType::Float32),
             chg_expr(f("close"), 12 * 21)
                 .over([col("ticker")])
-                .alias("pct1y").cast(DataType::Float32),
+                .alias("pct1y")
+                .cast(DataType::Float32),
             rv_expr("log_ret", 10, 252)
                 .over([col("ticker")])
-                .alias("rv10").cast(DataType::Float32),
+                .alias("rv10")
+                .cast(DataType::Float32),
             rv_expr("log_ret", 21, 252)
                 .over([col("ticker")])
-                .alias("rv21").cast(DataType::Float32),
+                .alias("rv21")
+                .cast(DataType::Float32),
             rv_expr("log_ret", 63, 252)
                 .over([col("ticker")])
-                .alias("rv63").cast(DataType::Float32),
+                .alias("rv63")
+                .cast(DataType::Float32),
             rv_expr("log_ret", 252, 252)
                 .over([col("ticker")])
-                .alias("rv252").cast(DataType::Float32),
+                .alias("rv252")
+                .cast(DataType::Float32),
             sma_expr("close", 5).over([col("ticker")]).alias("sma5"),
             sma_expr("close", 10).over([col("ticker")]).alias("sma10"),
             sma_expr("close", 20).over([col("ticker")]).alias("sma20"),
@@ -702,12 +556,13 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
             ema_expr("close", 200).over([col("ticker")]).alias("ema200"),
             ema_expr("close", 250).over([col("ticker")]).alias("ema250"),
         ])
-        // rs1y: pure arithmetic on per-ticker columns. No `.over()`.
+        // Composite relative-strength score.
         .with_columns([(lit(0.4) * col("pct1q")
             + lit(0.2) * col("pct2q")
             + lit(0.2) * col("pct3q")
             + lit(0.2) * col("pct1y"))
-        .alias("rs1y").cast(DataType::Float32)])
+        .alias("rs1y")
+        .cast(DataType::Float32)])
         .drop(["log_ret"]);
 
     let lf = with_macd(lf, 12, 26, 9);
@@ -717,20 +572,7 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     with_adx(lf, 14)
 }
 
-/// Compute the full weekly indicator set on a weekly-bars price LazyFrame.
-///
-/// Hurst must be applied upstream with a weekly-appropriate window
-/// (~100 bars ≈ 2 years).
-///
-/// Weekly-specific conventions:
-///   - SMA/EMA at 10/30/40/200 weeks (Stan Weinstein's 10/40-week trend rules)
-///   - ROC at 1w, 4w, 13w, 26w, 39w, 52w
-///   - RV at 4/13/52 weeks (annualized using 52 weeks/year)
-///   - avgvolume3m (13-bar SMA of volume)
-///   - max1y/min1y (52-bar rolling extrema)
-///   - rs1y (weighted composite of roc1q/2q/3q/1y at weekly cadence)
-///
-/// Timeframe-invariant: same MACD/Bollinger/RSI/ATR/ADX as daily.
+/// Compute weekly technical indicator columns.
 pub fn technical_indicators_weekly(lf: LazyFrame) -> LazyFrame {
     let range_opts = RollingOptionsFixedWindow {
         window_size: 52,

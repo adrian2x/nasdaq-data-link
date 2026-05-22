@@ -19,7 +19,6 @@ async fn main() -> Result<()> {
     ensure_directory(config::DOWNLOADS_DIR)?;
     ensure_directory(config::OUTPUT_DIR)?;
 
-    // --sync skips the downloader and rebuilds DuckDB from cached files.
     if std::env::args().skip(1).any(|arg| arg == "--sync") {
         return writer::run_writer();
     }
