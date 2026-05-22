@@ -13,6 +13,7 @@ pub const DUCKDB_FILENAME: &str = "nasdaq.duckdb";
 const PATHS_FILE: &str = "paths.txt";
 const ENV_FILE: &str = ".env";
 
+#[derive(Debug, Clone)]
 pub struct PathSpec {
     pub path: String,
     pub query: Option<HashMap<String, String>>,
@@ -20,7 +21,7 @@ pub struct PathSpec {
 }
 
 fn prompt(message: &str) -> Result<String> {
-    print!("{}", message);
+    print!("{message}");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -85,10 +86,10 @@ fn parse_path_line(line: &str) -> Option<PathSpec> {
     let mut query = None;
     let mut output = None;
     while let Some(flag) = tokens.next() {
-        let value = tokens.next().unwrap_or_else(|| {
-            eprintln!("Warning: flag {} in '{}' has no value", flag, line);
-            ""
-        });
+        let Some(value) = tokens.next() else {
+            eprintln!("Warning: flag {flag} in '{line}' has no value");
+            break;
+        };
         match flag {
             "-q" => {
                 let parsed = parse_query(value);

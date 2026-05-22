@@ -10,7 +10,7 @@ pub fn new_progress_bar(total: u64, message: &str) -> ProgressBar {
             .expect("invalid progress bar template")
             .progress_chars("=>-"),
     );
-    pb.set_message(message.to_string());
+    pb.set_message(message.to_owned());
     pb
 }
 
@@ -21,7 +21,7 @@ pub fn with_spinner<T>(label: &str, work: impl FnOnce() -> Result<T>) -> Result<
             .template("{spinner:.cyan} {msg}")
             .expect("invalid spinner template"),
     );
-    pb.set_message(label.to_string());
+    pb.set_message(label.to_owned());
     pb.enable_steady_tick(Duration::from_millis(80));
 
     let start = Instant::now();

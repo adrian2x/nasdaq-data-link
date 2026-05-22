@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::{sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 use crate::{
     api::nasdaq_api_get,
@@ -16,7 +16,7 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         output,
     } = spec;
 
-    let response = match nasdaq_api_get(&path, &api_key, query).await {
+    let response = match nasdaq_api_get(&path, &api_key, query.as_ref()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("✗ {} -> download failed: {}", path, e);
@@ -25,10 +25,10 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
     };
 
     let filepath = match output {
-        Some(name) => format!("{}/{}", DOWNLOADS_DIR, name),
+        Some(name) => PathBuf::from(DOWNLOADS_DIR).join(name),
         None => {
-            let base = path.replace('/', "_").replace(".json", "") + "_data";
-            format!("{}/{}.zip", DOWNLOADS_DIR, base)
+            let base = path.replace('/', "_").replace(".json", "") + "_data.zip";
+            PathBuf::from(DOWNLOADS_DIR).join(base)
         }
     };
 

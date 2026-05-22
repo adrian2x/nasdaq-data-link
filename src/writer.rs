@@ -1,15 +1,12 @@
 use anyhow::Result;
-use polars::prelude::{DataType, LazyFrame, ScanArgsParquet};
+use polars::prelude::*;
 
 use crate::config::DOWNLOADS_DIR;
 use crate::dataframetools::{
-    adjust_fundamentals, adjust_prices, csv_to_parquet, extract_zip_file, lf_to_duckdb, resample,
-    update_insiders,
+    adjust_fundamentals, adjust_prices, csv_to_parquet, extract_zip_file, lf_to_duckdb,
+    technical_indicators_daily, update_insiders,
 };
-use crate::sqltools::execute_sql_file;
 use crate::ui::with_spinner;
-
-const BUILD_COMPANIES_SQL: &str = "build_companies.sql";
 
 /// Unzip `downloads/<name>.csv.zip` and stream it to `downloads/<name>.parquet`.
 fn dataset_to_parquet(name: &str, schema_overrides: Option<&[(&str, DataType)]>) -> Result<String> {
@@ -35,7 +32,9 @@ fn scan_dataset(name: &str, schema_overrides: Option<&[(&str, DataType)]>) -> Re
     Ok(lf)
 }
 
-fn write_stocks() -> Result<()> {
+/// Build the enriched daily price table, write it, and return the LazyFrame
+/// so downstream steps (build_companies) can consume it without re-scanning.
+fn write_stocks() -> Result<LazyFrame> {
     let df = scan_dataset(
         "stocks_eod",
         Some(&[
@@ -48,35 +47,111 @@ fn write_stocks() -> Result<()> {
         ]),
     )?;
 
-    let daily = adjust_prices(df);
-    with_spinner("writing stocks_daily", || {
-        lf_to_duckdb(daily.clone(), "stocks_daily")
+    // adjust_prices yields the adjusted OHLCV bars; technical_indicators_daily
+    // enriches them with indicator columns. The result is a superset of the
+    // price data, so it is written as the single `stock_prices` table — no
+    // separate bars table is kept.
+    let prices = adjust_prices(df);
+    let enriched = technical_indicators_daily(prices);
+    with_spinner("writing stock_prices", || {
+        lf_to_duckdb(enriched.clone(), "stock_prices")
     })?;
 
-    let weekly = resample(daily, "1w");
-    with_spinner("writing stocks_weekly", || {
-        lf_to_duckdb(weekly, "stocks_weekly")
-    })?;
-
-    Ok(())
+    Ok(enriched)
 }
 
-fn write_financials() -> Result<()> {
+/// Build the TTM fundamentals table, write it, and return the LazyFrame so
+/// build_companies can consume it without re-scanning.
+fn write_financials() -> Result<LazyFrame> {
     let df = scan_dataset("financials_ttm", None)?;
 
     let financials_adj = adjust_fundamentals(df);
     with_spinner("writing financials_ttm", || {
-        lf_to_duckdb(financials_adj, "financials_ttm")
+        lf_to_duckdb(financials_adj.clone(), "financials_ttm")
     })?;
-    Ok(())
+    Ok(financials_adj)
 }
 
-fn write_companies() -> Result<()> {
-    dataset_to_parquet("companies", None)?;
+/// Build the `companies` snapshot: active companies joined to their latest
+/// fundamentals and latest price, with marketcap/ev recomputed at the latest
+/// close. Replaces the former build_companies.sql — done in Polars so the
+/// pipeline is engine-agnostic (only lf_to_duckdb touches the database).
+///
+/// The snapshot keeps every column from all three sources (companies,
+/// financials_ttm, stock_prices). The only shared column is `ticker` (the
+/// join key); marketcap/ev arrive raw from financials and are then
+/// overwritten by the latest-close recompute below.
+fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
+    let companies = scan_dataset("companies", None)?;
 
-    with_spinner("building companies snapshot", || {
-        execute_sql_file(BUILD_COMPANIES_SQL)
-    })?;
+    // Active companies only.
+    let active = companies.filter(col("isdelisted").eq(lit("N"))).drop([
+        "table",
+        "permaticker",
+        "isdelisted",
+        "cusips",
+        "sicsector",
+        "sicindustry",
+        "figi",
+        "famaindustry",
+        "scalemarketcap",
+        "scalerevenue",
+        "relatedtickers",
+        "lastupdated",
+        "firstadded",
+        "firstpricedate",
+        "lastpricedate",
+        "firstquarter",
+        "lastquarter",
+    ]);
+
+    // Latest fundamentals row per ticker without full-frame sort/join.
+    let latest_financials = financials
+        .with_column(
+            col("calendardate")
+                .max()
+                .over([col("ticker")])
+                .alias("__max_calendardate"),
+        )
+        .filter(col("calendardate").eq(col("__max_calendardate")))
+        .drop(["__max_calendardate"])
+        .group_by([col("ticker")])
+        .agg([all().last()]);
+
+    // Keep only the globally latest trading date first (strict active rule),
+    // then one row per ticker. This prunes aggressively before grouping.
+    let latest_prices = prices
+        .with_column(col("date").max().over([lit(1)]).alias("__max_date"))
+        .filter(col("date").eq(col("__max_date")))
+        .drop(["__max_date"])
+        .group_by([col("ticker")])
+        .agg([all().last()]);
+
+    // Inner-join active companies x latest fundamentals x latest price.
+    // INNER drops tickers missing either fundamentals or a current price.
+    // `ticker` is the only shared column, so no other column collides.
+    let joined = active
+        .join(
+            latest_financials,
+            [col("ticker")],
+            [col("ticker")],
+            JoinArgs::new(JoinType::Inner),
+        )
+        .join(
+            latest_prices,
+            [col("ticker")],
+            [col("ticker")],
+            JoinArgs::new(JoinType::Inner),
+        );
+
+    // Recompute marketcap and ev at the latest close (overwriting the raw
+    // Sharadar values): marketcap = shares*close, ev = marketcap + netdebt.
+    let snapshot = joined.with_columns([
+        (col("shares") * col("close")).alias("marketcap"),
+        (col("shares") * col("close") + col("netdebtusd")).alias("ev"),
+    ]);
+
+    with_spinner("writing companies", || lf_to_duckdb(snapshot, "companies"))?;
 
     Ok(())
 }
@@ -94,9 +169,9 @@ fn write_insiders() -> Result<()> {
 }
 
 pub fn run_writer() -> Result<()> {
-    write_stocks()?;
-    write_financials()?;
-    write_companies()?;
+    let prices = write_stocks()?;
+    let financials = write_financials()?;
+    write_companies(prices, financials)?;
     write_insiders()?;
     Ok(())
 }

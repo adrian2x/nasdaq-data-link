@@ -433,7 +433,6 @@ pub fn adjust_prices(lf: LazyFrame) -> LazyFrame {
         col("closeadj").cast(DataType::Float64).alias("close"),
         col("volume").cast(DataType::Float64),
     ])
-    .sort(["ticker", "date"], Default::default())
 }
 
 /// Resample OHLCV bars to a coarser interval, per ticker.
@@ -638,40 +637,55 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
 
     let lf = lf
         .sort(["ticker", "date"], Default::default())
-        .with_columns([(f("close") / f("close").shift(lit(1)))
+        .with_columns([
+            f("close")
+                .rolling_min(range_opts.clone())
+                .over([col("ticker")])
+                .alias("min1y"),
+            f("close")
+                .rolling_max(range_opts)
+                .over([col("ticker")])
+                .alias("max1y"),
+            sma_expr("volume", 20)
+                .over([col("ticker")])
+                .alias("avgvolume1m"),
+            sma_expr("volume", 50)
+                .over([col("ticker")])
+                .alias("avgvolume3m"),
+            (f("close") / f("close").shift(lit(1)))
             .log(std::f64::consts::E)
             .over([col("ticker")])
-            .alias("log_ret")])
+            .alias("log_ret"),])
         .with_columns([
-            chg_expr(f("close"), 1).over([col("ticker")]).alias("roc1d"),
-            chg_expr(f("close"), 5).over([col("ticker")]).alias("roc1w"),
+            chg_expr(f("close"), 1).over([col("ticker")]).alias("pct").cast(DataType::Float32),
+            chg_expr(f("close"), 5).over([col("ticker")]).alias("pct1w").cast(DataType::Float32),
             chg_expr(f("close"), 20)
                 .over([col("ticker")])
-                .alias("roc1m"),
+                .alias("pct1m").cast(DataType::Float32),
             chg_expr(f("close"), 3 * 21)
                 .over([col("ticker")])
-                .alias("roc1q"),
+                .alias("pct1q").cast(DataType::Float32),
             chg_expr(f("close"), 6 * 21)
                 .over([col("ticker")])
-                .alias("roc2q"),
+                .alias("pct2q").cast(DataType::Float32),
             chg_expr(f("close"), 9 * 21)
                 .over([col("ticker")])
-                .alias("roc3q"),
+                .alias("pct3q").cast(DataType::Float32),
             chg_expr(f("close"), 12 * 21)
                 .over([col("ticker")])
-                .alias("roc1y"),
-            rv_expr("log_ret", 5, 252)
+                .alias("pct1y").cast(DataType::Float32),
+            rv_expr("log_ret", 10, 252)
                 .over([col("ticker")])
-                .alias("rv1w"),
+                .alias("rv10").cast(DataType::Float32),
             rv_expr("log_ret", 21, 252)
                 .over([col("ticker")])
-                .alias("rv1m"),
+                .alias("rv21").cast(DataType::Float32),
             rv_expr("log_ret", 63, 252)
                 .over([col("ticker")])
-                .alias("rv1q"),
+                .alias("rv63").cast(DataType::Float32),
             rv_expr("log_ret", 252, 252)
                 .over([col("ticker")])
-                .alias("rv1y"),
+                .alias("rv252").cast(DataType::Float32),
             sma_expr("close", 5).over([col("ticker")]).alias("sma5"),
             sma_expr("close", 10).over([col("ticker")]).alias("sma10"),
             sma_expr("close", 20).over([col("ticker")]).alias("sma20"),
@@ -679,44 +693,22 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
             sma_expr("close", 100).over([col("ticker")]).alias("sma100"),
             sma_expr("close", 150).over([col("ticker")]).alias("sma150"),
             sma_expr("close", 200).over([col("ticker")]).alias("sma200"),
-            sma_expr("volume", 50)
-                .over([col("ticker")])
-                .alias("avgvolume3m"),
+            ema_expr("close", 8).over([col("ticker")]).alias("ema8"),
             ema_expr("close", 10).over([col("ticker")]).alias("ema10"),
+            ema_expr("close", 12).over([col("ticker")]).alias("ema12"),
             ema_expr("close", 20).over([col("ticker")]).alias("ema20"),
-            ema_expr("close", 63).over([col("ticker")]).alias("ema63"),
-            ema_expr("close", 126).over([col("ticker")]).alias("ema126"),
+            ema_expr("close", 26).over([col("ticker")]).alias("ema26"),
+            ema_expr("close", 50).over([col("ticker")]).alias("ema50"),
+            ema_expr("close", 200).over([col("ticker")]).alias("ema200"),
             ema_expr("close", 250).over([col("ticker")]).alias("ema250"),
-            f("close")
-                .rolling_max(range_opts.clone())
-                .over([col("ticker")])
-                .alias("max1y"),
-            f("close")
-                .rolling_min(range_opts)
-                .over([col("ticker")])
-                .alias("min1y"),
         ])
         // rs1y: pure arithmetic on per-ticker columns. No `.over()`.
-        .with_columns([(lit(0.4) * col("roc1q")
-            + lit(0.2) * col("roc2q")
-            + lit(0.2) * col("roc3q")
-            + lit(0.2) * col("roc1y"))
-        .alias("rs1y")])
-        .drop(["log_ret"])
-        .with_columns([
-            col("roc1d").cast(DataType::Float32),
-            col("roc1w").cast(DataType::Float32),
-            col("roc1m").cast(DataType::Float32),
-            col("roc1q").cast(DataType::Float32),
-            col("roc2q").cast(DataType::Float32),
-            col("roc3q").cast(DataType::Float32),
-            col("roc1y").cast(DataType::Float32),
-            col("rv1w").cast(DataType::Float32),
-            col("rv1m").cast(DataType::Float32),
-            col("rv1q").cast(DataType::Float32),
-            col("rv1y").cast(DataType::Float32),
-            col("rs1y").cast(DataType::Float32),
-        ]);
+        .with_columns([(lit(0.4) * col("pct1q")
+            + lit(0.2) * col("pct2q")
+            + lit(0.2) * col("pct3q")
+            + lit(0.2) * col("pct1y"))
+        .alias("rs1y").cast(DataType::Float32)])
+        .drop(["log_ret"]);
 
     let lf = with_macd(lf, 12, 26, 9);
     let lf = with_bollinger(lf, 20, 2.0);

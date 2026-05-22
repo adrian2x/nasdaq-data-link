@@ -115,8 +115,8 @@ impl HttpResponse {
     /// Returns an error if the response body contains invalid UTF-8 sequences.
     /// This commonly occurs with binary data such as images, compressed files,
     /// or other non-text content.
-    pub fn text(&self) -> Result<String> {
-        String::from_utf8(self.body.clone())
+    pub fn into_text(self) -> Result<String> {
+        String::from_utf8(self.body)
             .map_err(|e| anyhow!("Failed to convert bytes to UTF-8 string: {}", e))
     }
 }
@@ -436,7 +436,7 @@ const DOWNLOAD_TIMEOUT: u64 = 600;
 pub async fn nasdaq_api_get(
     path: &str,
     api_key: &str,
-    query: Option<HashMap<String, String>>,
+    query: Option<&HashMap<String, String>>,
 ) -> Result<HttpResponse> {
     let base_url = format!("{}/{}", NASDAQ_BASE_URL, path);
 
@@ -446,7 +446,7 @@ pub async fn nasdaq_api_get(
     query_params.insert("qopts.export".to_string(), "true".to_string());
 
     if let Some(extra_params) = query {
-        query_params.extend(extra_params);
+        query_params.extend(extra_params.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
     // Retry logic for getting download URL
@@ -470,7 +470,7 @@ pub async fn nasdaq_api_get(
             }
         };
 
-        let text = match response.text() {
+        let text = match response.into_text() {
             Ok(t) => t,
             Err(e) if attempt == MAX_RETRIES => {
                 return Err(anyhow!(
