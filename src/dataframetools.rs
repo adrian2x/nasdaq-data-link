@@ -12,6 +12,120 @@ fn f(name: &str) -> Expr {
     col(name).cast(DataType::Float64)
 }
 
+/// Partition `expr` per ticker and alias it. Wraps the
+/// `.over([col("ticker")]).alias(name)` boilerplate that every per-ticker
+/// indicator column repeats.
+fn per_ticker(expr: Expr, name: &str) -> Expr {
+    expr.over([col("ticker")]).alias(name)
+}
+
+/// Like `per_ticker`, but also casts the result to Float32. Used for the
+/// bounded-range indicator columns (percent changes, realized vol, scores)
+/// where Float32 precision is sufficient and halves the stored width.
+fn per_ticker_f32(expr: Expr, name: &str) -> Expr {
+    expr.over([col("ticker")])
+        .alias(name)
+        .cast(DataType::Float32)
+}
+
+/// Per-ticker SMA column: `sma("close", 50, "sma50")`.
+fn sma(source: &str, period: usize, name: &str) -> Expr {
+    per_ticker(sma_expr(source, period), name)
+}
+
+/// Per-ticker EMA column: `ema("close", 12, "ema12")`.
+fn ema(source: &str, span: usize, name: &str) -> Expr {
+    per_ticker(ema_expr(source, span), name)
+}
+
+/// Per-ticker percent-change column, cast to Float32:
+/// `pct("close", 5, "pct1w")`.
+fn pct(source: &str, period: i64, name: &str) -> Expr {
+    per_ticker_f32(chg_expr(f(source), period), name)
+}
+
+/// Per-ticker realized-volatility column, cast to Float32:
+/// `rv("log_ret", 21, 252, "rv21")`.
+fn rv(log_ret_col: &str, window: usize, trading_periods: usize, name: &str) -> Expr {
+    per_ticker_f32(rv_expr(log_ret_col, window, trading_periods), name)
+}
+
+/// Add SMA columns, one per period: `sma5`, `sma10`, ...
+fn with_sma_columns(lf: LazyFrame, source: &str, periods: &[usize]) -> LazyFrame {
+    let cols: Vec<Expr> = periods
+        .iter()
+        .map(|&p| sma(source, p, &format!("sma{p}")))
+        .collect();
+    lf.with_columns(cols)
+}
+
+/// Add EMA columns, one per span: `ema8`, `ema12`, ...
+fn with_ema_columns(lf: LazyFrame, source: &str, spans: &[usize]) -> LazyFrame {
+    let cols: Vec<Expr> = spans
+        .iter()
+        .map(|&s| ema(source, s, &format!("ema{s}")))
+        .collect();
+    lf.with_columns(cols)
+}
+
+/// Add percent-change columns, one per period: `pct1`, `pct5`, ...
+fn with_pct_columns(lf: LazyFrame, source: &str, periods: &[i64]) -> LazyFrame {
+    let cols: Vec<Expr> = periods
+        .iter()
+        .map(|&p| pct(source, p, &format!("pct{p}")))
+        .collect();
+    lf.with_columns(cols)
+}
+
+/// Add realized-volatility columns, one per window: `rv21`, `rv63`, ...
+/// Computes log-returns internally from `source`; the caller doesn't need
+/// to materialize a log-return column.
+fn with_rv_columns(
+    lf: LazyFrame,
+    source: &str,
+    trading_periods: usize,
+    windows: &[usize],
+) -> LazyFrame {
+    let lf = lf.with_columns([per_ticker(
+        (f(source) / f(source).shift(lit(1))).log(std::f64::consts::E),
+        "_log_ret",
+    )]);
+    let cols: Vec<Expr> = windows
+        .iter()
+        .map(|&w| rv("_log_ret", w, trading_periods, &format!("rv{w}")))
+        .collect();
+    lf.with_columns(cols).drop(["_log_ret"])
+}
+
+/// Add rolling min/max (Donchian channel) columns, two per window.
+/// Upper band uses intraday highs, lower band uses intraday lows — the
+/// standard Donchian construction. The channel covers the *prior* N bars
+/// (current bar excluded) so a same-bar high doesn't trivially break its
+/// own channel.
+fn with_minmax_columns(lf: LazyFrame, windows: &[usize]) -> LazyFrame {
+    let cols: Vec<Expr> = windows
+        .iter()
+        .flat_map(|&w| {
+            let opts = RollingOptionsFixedWindow {
+                window_size: w,
+                min_periods: w,
+                ..Default::default()
+            };
+            [
+                per_ticker(
+                    f("low").rolling_min(opts.clone()).shift(lit(1)),
+                    &format!("min{w}"),
+                ),
+                per_ticker(
+                    f("high").rolling_max(opts).shift(lit(1)),
+                    &format!("max{w}"),
+                ),
+            ]
+        })
+        .collect();
+    lf.with_columns(cols)
+}
+
 /// Simple moving average expression.
 pub fn sma_expr(source: &str, period: usize) -> Expr {
     f(source).rolling_mean(rolling_opts(period))
@@ -467,191 +581,41 @@ pub fn update_insiders(lf: LazyFrame) -> LazyFrame {
 
 /// Compute daily technical indicator columns.
 pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
-    let range_opts = RollingOptionsFixedWindow {
-        window_size: 250,
-        min_periods: 2,
-        ..Default::default()
-    };
-
+    // Average traded volume (liquidity filter)
     let lf = lf
         .sort(["ticker", "date"], Default::default())
-        .with_columns([
-            f("close")
-                .rolling_min(range_opts.clone())
-                .over([col("ticker")])
-                .alias("min1y"),
-            f("close")
-                .rolling_max(range_opts)
-                .over([col("ticker")])
-                .alias("max1y"),
-            sma_expr("volume", 20)
-                .over([col("ticker")])
-                .alias("avgvolume1m"),
-            sma_expr("volume", 50)
-                .over([col("ticker")])
-                .alias("avgvolume3m"),
-            (f("close") / f("close").shift(lit(1)))
-                .log(std::f64::consts::E)
-                .over([col("ticker")])
-                .alias("log_ret"),
-        ])
-        .with_columns([
-            chg_expr(f("close"), 1)
-                .over([col("ticker")])
-                .alias("pct")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 5)
-                .over([col("ticker")])
-                .alias("pct1w")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 20)
-                .over([col("ticker")])
-                .alias("pct1m")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 3 * 21)
-                .over([col("ticker")])
-                .alias("pct1q")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 6 * 21)
-                .over([col("ticker")])
-                .alias("pct2q")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 9 * 21)
-                .over([col("ticker")])
-                .alias("pct3q")
-                .cast(DataType::Float32),
-            chg_expr(f("close"), 12 * 21)
-                .over([col("ticker")])
-                .alias("pct1y")
-                .cast(DataType::Float32),
-            rv_expr("log_ret", 10, 252)
-                .over([col("ticker")])
-                .alias("rv10")
-                .cast(DataType::Float32),
-            rv_expr("log_ret", 21, 252)
-                .over([col("ticker")])
-                .alias("rv21")
-                .cast(DataType::Float32),
-            rv_expr("log_ret", 63, 252)
-                .over([col("ticker")])
-                .alias("rv63")
-                .cast(DataType::Float32),
-            rv_expr("log_ret", 252, 252)
-                .over([col("ticker")])
-                .alias("rv252")
-                .cast(DataType::Float32),
-            sma_expr("close", 5).over([col("ticker")]).alias("sma5"),
-            sma_expr("close", 10).over([col("ticker")]).alias("sma10"),
-            sma_expr("close", 20).over([col("ticker")]).alias("sma20"),
-            sma_expr("close", 50).over([col("ticker")]).alias("sma50"),
-            sma_expr("close", 100).over([col("ticker")]).alias("sma100"),
-            sma_expr("close", 150).over([col("ticker")]).alias("sma150"),
-            sma_expr("close", 200).over([col("ticker")]).alias("sma200"),
-            ema_expr("close", 8).over([col("ticker")]).alias("ema8"),
-            ema_expr("close", 10).over([col("ticker")]).alias("ema10"),
-            ema_expr("close", 12).over([col("ticker")]).alias("ema12"),
-            ema_expr("close", 20).over([col("ticker")]).alias("ema20"),
-            ema_expr("close", 26).over([col("ticker")]).alias("ema26"),
-            ema_expr("close", 50).over([col("ticker")]).alias("ema50"),
-            ema_expr("close", 200).over([col("ticker")]).alias("ema200"),
-            ema_expr("close", 250).over([col("ticker")]).alias("ema250"),
-        ])
-        // Composite relative-strength score.
-        .with_columns([(lit(0.4) * col("pct1q")
-            + lit(0.2) * col("pct2q")
-            + lit(0.2) * col("pct3q")
-            + lit(0.2) * col("pct1y"))
-        .alias("rs1y")
-        .cast(DataType::Float32)])
-        .drop(["log_ret"]);
+        .with_columns([sma("volume", 50, "avgvolume3m")]);
 
+    // 52-Week High and Low price range
+    let lf = with_minmax_columns(lf, &[252]);
+    // Donchian channel ranges (commonly 1m and 1q highs and lows)
+    let lf = with_minmax_columns(lf, &[20, 55]);
+
+    // Time-series momentum (rate of change of price, in percent).
+    // Lookbacks ~1w, 1m, 3m, 6m, 9m, 12m at 21 trading days per month.
+    let lf = with_pct_columns(lf, "close", &[5, 21, 3 * 21, 6 * 21, 9 * 21, 12 * 21]);
+    // Composite Relative Strength score (cross-sectional momentum),
+    // a weighted blend of the 3m/6m/9m/12m lookbacks.
+    let lf = lf.with_columns([(lit(0.4) * col("pct63")
+        + lit(0.2) * col("pct126")
+        + lit(0.2) * col("pct189")
+        + lit(0.2) * col("pct252"))
+    .alias("rs1y")
+    .cast(DataType::Float32)]);
+
+    // Moving Averages used for trend filters
+    let lf = with_sma_columns(lf, "close", &[10, 20, 50, 100, 150, 200]);
+    // MACD often used to measure trend and momentum
     let lf = with_macd(lf, 12, 26, 9);
+    // ADX used to measure trend strength
+    let lf = with_adx(lf, 14);
+
+    // Realized volatility (annualized, in percent)
+    let lf = with_rv_columns(lf, "close", 252, &[21, 63, 252]);
+
+    // Bollinger Band indicator and ATR for volatility breakouts, mean reversion
     let lf = with_bollinger(lf, 20, 2.0);
-    let lf = with_rsi(lf, 14);
     let lf = with_atr(lf, 14);
-    with_adx(lf, 14)
-}
-
-/// Compute weekly technical indicator columns.
-pub fn technical_indicators_weekly(lf: LazyFrame) -> LazyFrame {
-    let range_opts = RollingOptionsFixedWindow {
-        window_size: 52,
-        min_periods: 2,
-        ..Default::default()
-    };
-
-    let lf = lf
-        .sort(["ticker", "date"], Default::default())
-        .with_columns([(f("close") / f("close").shift(lit(1)))
-            .log(std::f64::consts::E)
-            .over([col("ticker")])
-            .alias("log_ret")])
-        .with_columns([
-            chg_expr(f("close"), 1).over([col("ticker")]).alias("roc1w"),
-            chg_expr(f("close"), 4).over([col("ticker")]).alias("roc1m"),
-            chg_expr(f("close"), 13)
-                .over([col("ticker")])
-                .alias("roc1q"),
-            chg_expr(f("close"), 26)
-                .over([col("ticker")])
-                .alias("roc2q"),
-            chg_expr(f("close"), 39)
-                .over([col("ticker")])
-                .alias("roc3q"),
-            chg_expr(f("close"), 52)
-                .over([col("ticker")])
-                .alias("roc1y"),
-            rv_expr("log_ret", 4, 52)
-                .over([col("ticker")])
-                .alias("rv1m"),
-            rv_expr("log_ret", 13, 52)
-                .over([col("ticker")])
-                .alias("rv1q"),
-            rv_expr("log_ret", 52, 52)
-                .over([col("ticker")])
-                .alias("rv1y"),
-            sma_expr("close", 10).over([col("ticker")]).alias("sma10"),
-            sma_expr("close", 30).over([col("ticker")]).alias("sma30"),
-            sma_expr("close", 40).over([col("ticker")]).alias("sma40"),
-            sma_expr("close", 200).over([col("ticker")]).alias("sma200"),
-            sma_expr("volume", 13)
-                .over([col("ticker")])
-                .alias("avgvolume3m"),
-            ema_expr("close", 10).over([col("ticker")]).alias("ema10"),
-            ema_expr("close", 30).over([col("ticker")]).alias("ema30"),
-            ema_expr("close", 40).over([col("ticker")]).alias("ema40"),
-            ema_expr("close", 200).over([col("ticker")]).alias("ema200"),
-            f("close")
-                .rolling_max(range_opts.clone())
-                .over([col("ticker")])
-                .alias("max1y"),
-            f("close")
-                .rolling_min(range_opts)
-                .over([col("ticker")])
-                .alias("min1y"),
-        ])
-        .with_columns([(lit(0.4) * col("roc1q")
-            + lit(0.2) * col("roc2q")
-            + lit(0.2) * col("roc3q")
-            + lit(0.2) * col("roc1y"))
-        .alias("rs1y")])
-        .drop(["log_ret"])
-        .with_columns([
-            col("roc1w").cast(DataType::Float32),
-            col("roc1m").cast(DataType::Float32),
-            col("roc1q").cast(DataType::Float32),
-            col("roc2q").cast(DataType::Float32),
-            col("roc3q").cast(DataType::Float32),
-            col("roc1y").cast(DataType::Float32),
-            col("rv1m").cast(DataType::Float32),
-            col("rv1q").cast(DataType::Float32),
-            col("rv1y").cast(DataType::Float32),
-            col("rs1y").cast(DataType::Float32),
-        ]);
-
-    let lf = with_macd(lf, 12, 26, 9);
-    let lf = with_bollinger(lf, 20, 2.0);
-    let lf = with_rsi(lf, 14);
-    let lf = with_atr(lf, 14);
-    with_adx(lf, 14)
+    // RSI indicator used for mean reversion
+    with_rsi(lf, 14)
 }

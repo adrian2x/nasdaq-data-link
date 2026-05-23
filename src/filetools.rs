@@ -1,12 +1,13 @@
 use ::zip::ZipArchive;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use arrow::ipc::writer::FileWriter;
 use polars::prelude::*;
 use std::fs::File;
 use std::io::copy;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::config::{DOWNLOADS_DIR, OUTPUT_DIR};
-use crate::ui::with_spinner;
+use crate::config::{DOWNLOADS_DIR, DUCKDB_FILENAME, OUTPUT_DIR};
+use crate::ui::{new_progress_bar, with_spinner};
 
 /// Write bytes to a path, creating parent directories when needed.
 pub fn save_file(data: &[u8], filepath: impl AsRef<Path>) -> Result<()> {
@@ -124,15 +125,120 @@ pub fn lf_to_duckdb(lf: LazyFrame, table: &str) -> Result<()> {
     let mut df = lf.collect()?;
     ParquetWriter::new(File::create(&parquet_path)?).finish(&mut df)?;
 
-    let qt = quote_ident(table);
     crate::sqltools::execute_sql(
         &format!("create_{table}"),
-        &format!("CREATE OR REPLACE TABLE {qt} AS SELECT * FROM read_parquet('{parquet_path}');"),
+        &format!(
+            "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM read_parquet('{parquet_path}');"
+        ),
     )?;
 
     Ok(())
 }
 
-fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('\"', "\"\""))
+fn sanitize_ticker_for_filename(ticker: &str) -> String {
+    ticker
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn export_arrow(conn: &duckdb::Connection, query: &str, path: &Path) -> Result<()> {
+    let mut stmt = conn
+        .prepare(query)
+        .with_context(|| format!("preparing export query: {query}"))?;
+    let batches = stmt
+        .query_arrow([])
+        .with_context(|| format!("running export query: {query}"))?;
+    let schema = batches.get_schema();
+
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut writer = FileWriter::try_new(file, &schema)
+        .with_context(|| format!("opening arrow writer for {}", path.display()))?;
+    for batch in batches {
+        writer
+            .write(&batch)
+            .with_context(|| format!("writing batch to {}", path.display()))?;
+    }
+    writer
+        .finish()
+        .with_context(|| format!("closing arrow writer for {}", path.display()))?;
+    Ok(())
+}
+
+pub fn write_arrow_files() -> Result<()> {
+    let arrow_dir = PathBuf::from(OUTPUT_DIR).join("arrow");
+    std::fs::create_dir_all(&arrow_dir)?;
+
+    let conn = duckdb::Connection::open(DUCKDB_FILENAME)
+        .with_context(|| format!("opening {}", DUCKDB_FILENAME))?;
+
+    export_arrow(
+        &conn,
+        "SELECT * FROM companies",
+        &arrow_dir.join("companies.arrow"),
+    )?;
+
+    let mut stmt = conn
+        .prepare("SELECT ticker FROM companies WHERE ticker IS NOT NULL ORDER BY ticker")
+        .context("preparing ticker export query")?;
+    let ticker_rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("reading ticker list for arrow exports")?;
+
+    let tickers: Vec<String> = ticker_rows.collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    let pb = new_progress_bar(tickers.len() as u64, "arrow files");
+
+    for ticker in tickers {
+        let file_ticker = sanitize_ticker_for_filename(&ticker);
+        pb.set_message(format!("arrow {ticker}"));
+
+        export_arrow(
+            &conn,
+            &format!("SELECT * FROM companies WHERE ticker = '{ticker}' LIMIT 1"),
+            &arrow_dir.join(format!("{file_ticker}_metrics.arrow")),
+        )?;
+
+        export_arrow(
+            &conn,
+            &format!(
+                "SELECT * EXCLUDE (ticker) FROM financials_ttm WHERE ticker = '{ticker}' ORDER BY calendardate"
+            ),
+            &arrow_dir.join(format!("{file_ticker}_financials.arrow")),
+        )?;
+
+        export_arrow(
+            &conn,
+            &format!(
+                "SELECT * EXCLUDE (ticker) FROM insiders \
+                 WHERE ticker = '{ticker}' \
+                   AND (transactioncode IS NULL OR transactioncode NOT IN ('M','A','D','J','G','C')) \
+                 ORDER BY date DESC, transactionvalue DESC"
+            ),
+            &arrow_dir.join(format!("{file_ticker}_insiders.arrow")),
+        )?;
+
+        export_arrow(
+            &conn,
+            &format!(
+                "SELECT date, open, high, low, close, volume \
+                 FROM stock_prices \
+                 WHERE ticker = '{ticker}' \
+                 ORDER BY date"
+            ),
+            &arrow_dir.join(format!("{file_ticker}_prices.arrow")),
+        )?;
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("arrow files");
+    Ok(())
 }

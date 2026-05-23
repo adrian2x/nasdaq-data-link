@@ -4,7 +4,8 @@ use polars::prelude::*;
 use crate::dataframetools::{
     adjust_fundamentals, adjust_prices, technical_indicators_daily, update_insiders,
 };
-use crate::filetools::{lf_to_duckdb, scan_dataset};
+use crate::filetools::{lf_to_duckdb, scan_dataset, write_arrow_files};
+use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::ui::with_spinner;
 
 fn write_stocks() -> Result<LazyFrame> {
@@ -21,12 +22,16 @@ fn write_stocks() -> Result<LazyFrame> {
     )?;
 
     let prices = adjust_prices(df);
-    let enriched = technical_indicators_daily(prices);
+    let prices_with_hurst = with_spinner("computing hurst", || {
+        let prices_df = prices.clone().collect()?;
+        with_hurst(prices_df, HurstConfig::default()).map_err(anyhow::Error::from)
+    })?;
+    let df = technical_indicators_daily(prices_with_hurst.lazy());
     with_spinner("writing stock_prices", || {
-        lf_to_duckdb(enriched.clone(), "stock_prices")
+        lf_to_duckdb(df.clone(), "stock_prices")
     })?;
 
-    Ok(enriched)
+    Ok(df)
 }
 
 fn write_financials() -> Result<LazyFrame> {
@@ -42,7 +47,6 @@ fn write_financials() -> Result<LazyFrame> {
 fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
     let companies = scan_dataset("companies", None)?;
 
-    // Keep active listings only.
     let active = companies.filter(col("isdelisted").eq(lit("N"))).drop([
         "table",
         "permaticker",
@@ -63,7 +67,6 @@ fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
         "lastquarter",
     ]);
 
-    // Latest fundamentals row per ticker.
     let latest_financials = financials
         .with_column(
             col("calendardate")
@@ -76,7 +79,6 @@ fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
         .group_by([col("ticker")])
         .agg([all().last()]);
 
-    // Strictly current tickers: ticker's latest row must be on global latest date.
     let latest_prices = prices
         .with_column(col("date").max().over([lit(1)]).alias("__max_date"))
         .filter(col("date").eq(col("__max_date")))
@@ -98,7 +100,6 @@ fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
             JoinArgs::new(JoinType::Inner),
         );
 
-    // Recompute valuation fields at latest close.
     let snapshot = joined.with_columns([
         (col("shares") * col("close")).alias("marketcap"),
         (col("shares") * col("close") + col("netdebtusd")).alias("ev"),
@@ -125,5 +126,6 @@ pub fn run_writer() -> Result<()> {
     let financials = write_financials()?;
     write_companies(prices, financials)?;
     write_insiders()?;
+    write_arrow_files()?;
     Ok(())
 }
