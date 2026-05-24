@@ -438,6 +438,27 @@ pub fn resample(lf: LazyFrame, interval: &str) -> LazyFrame {
     .sort(["ticker", "date"], Default::default())
 }
 
+pub fn with_rank(
+    lf: LazyFrame,
+    source: &str,
+    date_col: &str,
+    ascending: bool,
+    alias: &str,
+) -> LazyFrame {
+    let opts = RankOptions {
+        descending: !ascending,
+        ..Default::default()
+    };
+
+    // n = count of non-null `source` values within the date group.
+    let n = col(source).count().over([col(date_col)]);
+    let rank = col(source).rank(opts, None).over([col(date_col)]);
+
+    lf.with_columns([(((rank - lit(1.0)) / (n - lit(1.0))) * lit(100.0))
+        .alias(alias)
+        .cast(DataType::Float32)])
+}
+
 /// Transform raw fundamentals into analysis columns.
 pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
     lf.with_columns([col("calendardate").cast(DataType::Date)])
@@ -594,7 +615,8 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     // Time-series momentum (rate of change of price, in percent).
     // Lookbacks ~1w, 1m, 3m, 6m, 9m, 12m at 21 trading days per month.
     let lf = with_pct_columns(lf, "close", &[5, 21, 3 * 21, 6 * 21, 9 * 21, 12 * 21]);
-    // Composite Relative Strength score (cross-sectional momentum),
+
+    // Composite Relative Strength (cross-sectional momentum),
     // a weighted blend of the 3m/6m/9m/12m lookbacks.
     let lf = lf.with_columns([(lit(0.4) * col("pct63")
         + lit(0.2) * col("pct126")
@@ -602,6 +624,9 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
         + lit(0.2) * col("pct252"))
     .alias("rs1y")
     .cast(DataType::Float32)]);
+    // Replace the scalar value of Relative Strength with the cross-sectional
+    // ranking from 0-100 were 100 is best.
+    let lf = with_rank(lf, "rs1y", "date", true, "rs1y");
 
     // Moving Averages used for trend filters
     let lf = with_sma_columns(lf, "close", &[10, 20, 50, 100, 150, 200]);
