@@ -1,6 +1,7 @@
 mod api;
 mod config;
-mod dataframetools;
+mod indicators;
+mod pipeline;
 mod downloader;
 mod filetools;
 mod fractaltools;

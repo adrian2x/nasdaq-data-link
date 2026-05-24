@@ -1,9 +1,8 @@
 use anyhow::Result;
 use polars::prelude::*;
 
-use crate::dataframetools::{
-    adjust_fundamentals, adjust_prices, technical_indicators_daily, update_insiders,
-};
+use crate::indicators::technical_indicators_daily;
+use crate::pipeline::{adjust_fundamentals, adjust_prices, update_insiders};
 use crate::filetools::{lf_to_duckdb, scan_dataset, write_arrow_files};
 use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::ui::with_spinner;
