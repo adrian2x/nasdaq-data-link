@@ -39,6 +39,7 @@ pub fn percentile(
     let rank = col(source).rank(opts, None).over([col(date_col)]);
 
     lf.with_columns([(((rank - lit(1.0)) / (n - lit(1.0))) * lit(100.0))
+        .round(2)
         .alias(alias)
         .cast(DataType::Float32)])
 }

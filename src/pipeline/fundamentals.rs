@@ -6,6 +6,8 @@
 
 use polars::prelude::*;
 
+use crate::indicators::fs_score;
+
 /// Cast a column to Float64.
 fn f(name: &str) -> Expr {
     col(name).cast(DataType::Float64)
@@ -40,37 +42,73 @@ pub fn cagr_expr(source: Expr, years: i64) -> Expr {
 
 /// Transform raw fundamentals into analysis columns.
 pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
-    lf.with_columns([col("calendardate").cast(DataType::Date)])
+    let lf = lf
+        .with_columns([col("calendardate").cast(DataType::Date)])
         .drop(["dimension", "lastupdated"])
         .with_columns([
             (f("sharesbas") * f("sharefactor")).alias("shares"),
-            (f("dps") / f("fxusd")).alias("dpsusd"),
-            (f("eps") / f("fxusd")).alias("epsusd"),
             (f("ncfo") / f("fxusd")).alias("ncfousd"),
             (f("fcf") / f("fxusd")).alias("fcfusd"),
             (f("assets") - f("liabilities")).alias("equity"),
             ((f("debt") - f("cashneq")) / f("fxusd")).alias("netdebtusd"),
-            (lit(100.0) * f("roe")).alias("roe"),
-            (lit(100.0) * f("roic")).alias("roic"),
-            (lit(100.0) * f("roa")).alias("roa"),
-            (f("ncfo") / f("opinc")).alias("cfc"),
-            (f("ebit") / f("intexp")).alias("icr"),
-            (lit(100.0) * f("ebit") / (f("assets") - f("liabilitiesc"))).alias("roce"),
-            ((f("netinc") - f("netincdis")) / f("fxusd")).alias("netincadj"),
+            (lit(100.0) * f("roe"))
+                .round(1)
+                .alias("roe")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("roic"))
+                .round(1)
+                .alias("roic")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("roa"))
+                .round(1)
+                .alias("roa")
+                .cast(DataType::Float32),
+            (f("ncfo") / f("opinc"))
+                .round(3)
+                .alias("cfc")
+                .cast(DataType::Float32),
+            (f("ebit") / f("intexp"))
+                .round(3)
+                .alias("icr")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("ebit") / (f("assets") - f("liabilitiesc")))
+                .round(1)
+                .alias("roce")
+                .cast(DataType::Float32),
+            ((f("netinccmn") - f("netincdis")) / f("fxusd")).alias("netincadj"),
             ((lit(-1.0) * f("ncfcommon") / f("fxusd")) / f("marketcap") * lit(100.0))
-                .alias("bbyield"),
-            (lit(100.0) * f("divyield")).alias("divyield"),
+                .round(1)
+                .alias("bbyield")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("divyield"))
+                .round(1)
+                .alias("divyield")
+                .cast(DataType::Float32),
             ((lit(-1.0) * f("ncfdiv") + lit(-1.0) * f("ncfcommon")) / f("fxusd"))
                 .alias("shreturnusd"),
-            (lit(100.0) * f("gp") / f("revenue")).alias("grossmargin"),
-            (lit(100.0) * f("ebitda") / f("revenue")).alias("ebitdamargin"),
-            (lit(100.0) * f("ebit") / f("revenue")).alias("ebitmargin"),
+            (lit(100.0) * f("gp") / f("revenue"))
+                .round(1)
+                .alias("grossmargin")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("ebitda") / f("revenue"))
+                .round(1)
+                .alias("ebitdamargin")
+                .cast(DataType::Float32),
+            (lit(100.0) * f("ebit") / f("revenue"))
+                .round(1)
+                .alias("ebitmargin")
+                .cast(DataType::Float32),
         ])
         .with_columns([
-            (f("debt") / f("equity")).alias("de"),
+            (f("debt") / f("equity"))
+                .round(3)
+                .alias("de")
+                .cast(DataType::Float32),
             (f("netincadj") / f("shares")).alias("epsadj"),
-            (lit(100.0) * f("netincadj") / f("revenueusd")).alias("netmargin"),
-            (lit(100.0) * f("shreturnusd") / f("marketcap")).alias("shyield"),
+            (lit(100.0) * f("shreturnusd") / f("marketcap"))
+                .round(1)
+                .alias("shyield")
+                .cast(DataType::Float32),
         ])
         .sort(["ticker", "calendardate"], Default::default())
         // `shift`-based metrics require sorted time order.
@@ -95,67 +133,112 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
         // `{item}cagr{n}y` true CAGR, null when an endpoint is <= 0
         //                  (`cagr_expr`); no 1y CAGR — it equals 1y growth.
         .with_columns({
-            let revenue = f("revenue") / f("shares");
             let ebitda = f("ebitdausd") / f("shares");
             let eps = f("epsadj");
-            let fcf = f("fcfpsadj");
+            let fcfps = f("fcfpsadj");
             [
-                growth_expr(revenue.clone(), 4)
+                growth_expr(col("sps"), 4)
                     .over([col("ticker")])
-                    .alias("revenue1y"),
-                growth_expr(revenue.clone(), 4 * 3)
+                    .round(1)
+                    .alias("revenue1y")
+                    .cast(DataType::Float32),
+                growth_expr(col("sps"), 4 * 3)
                     .over([col("ticker")])
-                    .alias("revenue3y"),
-                growth_expr(revenue.clone(), 4 * 5)
+                    .round(1)
+                    .alias("revenue3y")
+                    .cast(DataType::Float32),
+                growth_expr(col("sps"), 4 * 5)
                     .over([col("ticker")])
-                    .alias("revenue5y"),
-                cagr_expr(revenue.clone(), 3)
+                    .round(1)
+                    .alias("revenue5y")
+                    .cast(DataType::Float32),
+                cagr_expr(col("sps"), 3)
                     .over([col("ticker")])
-                    .alias("revenuecagr3y"),
-                cagr_expr(revenue, 5)
+                    .round(1)
+                    .alias("revenuecagr3y")
+                    .cast(DataType::Float32),
+                cagr_expr(col("sps"), 5)
                     .over([col("ticker")])
-                    .alias("revenuecagr5y"),
+                    .round(1)
+                    .alias("revenuecagr5y")
+                    .cast(DataType::Float32),
                 growth_expr(ebitda.clone(), 4)
                     .over([col("ticker")])
-                    .alias("ebitda1y"),
+                    .round(1)
+                    .alias("ebitda1y")
+                    .cast(DataType::Float32),
                 growth_expr(ebitda.clone(), 4 * 3)
                     .over([col("ticker")])
-                    .alias("ebitda3y"),
+                    .round(1)
+                    .alias("ebitda3y")
+                    .cast(DataType::Float32),
                 growth_expr(ebitda.clone(), 4 * 5)
                     .over([col("ticker")])
-                    .alias("ebitda5y"),
+                    .round(1)
+                    .alias("ebitda5y")
+                    .cast(DataType::Float32),
                 cagr_expr(ebitda.clone(), 3)
                     .over([col("ticker")])
-                    .alias("ebitdacagr3y"),
+                    .round(1)
+                    .alias("ebitdacagr3y")
+                    .cast(DataType::Float32),
                 cagr_expr(ebitda, 5)
                     .over([col("ticker")])
-                    .alias("ebitdacagr5y"),
+                    .round(1)
+                    .alias("ebitdacagr5y")
+                    .cast(DataType::Float32),
                 growth_expr(eps.clone(), 4)
                     .over([col("ticker")])
-                    .alias("eps1y"),
+                    .round(1)
+                    .alias("eps1y")
+                    .cast(DataType::Float32),
                 growth_expr(eps.clone(), 4 * 3)
                     .over([col("ticker")])
-                    .alias("eps3y"),
+                    .round(1)
+                    .alias("eps3y")
+                    .cast(DataType::Float32),
                 growth_expr(eps.clone(), 4 * 5)
                     .over([col("ticker")])
-                    .alias("eps5y"),
+                    .round(1)
+                    .alias("eps5y")
+                    .cast(DataType::Float32),
                 cagr_expr(eps.clone(), 3)
                     .over([col("ticker")])
-                    .alias("epscagr3y"),
-                cagr_expr(eps, 5).over([col("ticker")]).alias("epscagr5y"),
-                growth_expr(fcf.clone(), 4)
+                    .round(1)
+                    .alias("epscagr3y")
+                    .cast(DataType::Float32),
+                cagr_expr(eps, 5)
                     .over([col("ticker")])
-                    .alias("fcf1y"),
-                growth_expr(fcf.clone(), 4 * 3)
+                    .round(1)
+                    .alias("epscagr5y")
+                    .cast(DataType::Float32),
+                growth_expr(fcfps.clone(), 4)
                     .over([col("ticker")])
-                    .alias("fcf3y"),
-                growth_expr(fcf.clone(), 4 * 5)
+                    .round(1)
+                    .alias("fcf1y")
+                    .cast(DataType::Float32),
+                growth_expr(fcfps.clone(), 4 * 3)
                     .over([col("ticker")])
-                    .alias("fcf5y"),
-                cagr_expr(fcf.clone(), 3)
+                    .round(1)
+                    .alias("fcf3y")
+                    .cast(DataType::Float32),
+                growth_expr(fcfps.clone(), 4 * 5)
                     .over([col("ticker")])
-                    .alias("fcfcagr3y"),
-                cagr_expr(fcf, 5).over([col("ticker")]).alias("fcfcagr5y"),
+                    .round(1)
+                    .alias("fcf5y")
+                    .cast(DataType::Float32),
+                cagr_expr(fcfps.clone(), 3)
+                    .over([col("ticker")])
+                    .round(1)
+                    .alias("fcfcagr3y")
+                    .cast(DataType::Float32),
+                cagr_expr(fcfps, 5)
+                    .over([col("ticker")])
+                    .round(1)
+                    .alias("fcfcagr5y")
+                    .cast(DataType::Float32),
             ]
-        })
+        });
+    let lf = fs_score(lf);
+    lf
 }

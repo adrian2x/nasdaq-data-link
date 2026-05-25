@@ -29,6 +29,7 @@ pub fn rate_of_change(lf: LazyFrame, source: &str, periods: &[i64]) -> LazyFrame
         .map(|&p| {
             chg_expr(f(source), p)
                 .over([col("ticker")])
+                .round(2)
                 .alias(format!("pct{p}"))
                 .cast(DataType::Float32)
         })
