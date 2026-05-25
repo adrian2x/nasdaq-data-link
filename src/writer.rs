@@ -1,40 +1,40 @@
+use crate::indicators::{ewma_vol, realized_volatility, yang_zhang};
 use anyhow::Result;
 use polars::prelude::*;
-use crate::indicators::realized_volatility;
 
+use crate::filetools::{df_to_duckdb, lf_to_duckdb, scan_dataset, write_arrow_files};
+use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::pipeline::{
-    adjust_fundamentals, adjust_prices, build_company_snapshot, technical_indicators_daily,
+    adjust_fundamentals, build_company_snapshot, load_prices_adjusted, technical_indicators_daily,
     update_insiders,
 };
-use crate::filetools::{lf_to_duckdb, scan_dataset, write_arrow_files};
-use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::ui::with_spinner;
 
 fn write_stocks() -> Result<LazyFrame> {
-    let df = scan_dataset(
-        "stocks_eod",
-        Some(&[
-            ("open", DataType::Float64),
-            ("high", DataType::Float64),
-            ("low", DataType::Float64),
-            ("close", DataType::Float64),
-            ("closeadj", DataType::Float64),
-            ("volume", DataType::Float64),
-        ]),
-    )?;
+    // load_prices_adjusted guarantees rows sorted by (ticker, date).
+    // Downstream `over("ticker")` rolling computations depend on this.
+    let prices = load_prices_adjusted()?;
 
-    let prices = adjust_prices(df);
-    let prices_with_hurst = with_spinner("computing hurst", || {
-        let prices_df = prices.clone().collect()?;
-        with_hurst(prices_df, HurstConfig::default()).map_err(anyhow::Error::from)
+    let df = technical_indicators_daily(prices);
+    // let df = realized_volatility(df, "close", 252, &[5, 21, 63, 252]);
+    // let df = yang_zhang(df, 21, 252.0)?;
+    // let df = ewma_vol(df, 0.94, 252.0)?;
+
+    let df = with_spinner("applying indicators", || {
+        df.collect().map_err(anyhow::Error::from)
     })?;
-    let df = technical_indicators_daily(prices_with_hurst.lazy());
-    let df = realized_volatility(df, "close", 252, &[5, 21, 63, 252]);
+
+    let mut df = with_spinner("computing hurst", || {
+        with_hurst(df, HurstConfig::default()).map_err(anyhow::Error::from)
+    })?;
+
+    // with_hurst already returns a materialized DataFrame — write it
+    // directly rather than re-lazying and forcing another collect.
     with_spinner("writing stock_prices", || {
-        lf_to_duckdb(df.clone(), "stock_prices")
+        df_to_duckdb(&mut df, "stock_prices")
     })?;
 
-    Ok(df)
+    Ok(df.lazy())
 }
 
 fn write_financials() -> Result<LazyFrame> {

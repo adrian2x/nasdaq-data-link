@@ -135,6 +135,27 @@ pub fn lf_to_duckdb(lf: LazyFrame, table: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn df_to_duckdb(df: &mut DataFrame, table: &str) -> Result<()> {
+    let table = table.trim();
+    if table.is_empty() {
+        return Err(anyhow!("table name cannot be empty"));
+    }
+
+    std::fs::create_dir_all(OUTPUT_DIR)?;
+    let parquet_path = format!("{OUTPUT_DIR}/{table}.parquet");
+
+    ParquetWriter::new(File::create(&parquet_path)?).finish(df)?;
+
+    crate::sqltools::execute_sql(
+        &format!("create_{table}"),
+        &format!(
+            "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM read_parquet('{parquet_path}');"
+        ),
+    )?;
+
+    Ok(())
+}
+
 fn sanitize_ticker_for_filename(ticker: &str) -> String {
     ticker
         .chars()

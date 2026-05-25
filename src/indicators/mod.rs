@@ -5,9 +5,9 @@
 //! and re-exports the indicator primitives consumed by pipeline assembly code.
 
 mod adx;
+mod adr;
 mod atr;
 mod bollinger;
-mod donchian;
 mod ema;
 mod highlows;
 mod macd;
@@ -18,11 +18,12 @@ mod rsi;
 mod sma;
 mod yang_zhang;
 mod ewma_volatility;
+mod fs_score;
 
 pub use self::adx::adx;
+pub use self::adr::adr;
 pub use self::atr::atr;
 pub use self::bollinger::bollinger;
-pub use self::donchian::donchian;
 pub use self::highlows::highlows;
 pub use self::macd::macd;
 pub use self::rank::percentile;
@@ -30,3 +31,6 @@ pub use self::rate_of_change::rate_of_change;
 pub use self::realized_volatility::realized_volatility;
 pub use self::rsi::rsi;
 pub use self::sma::{sma, sma_expr};
+pub use self::yang_zhang::yang_zhang;
+pub use self::ewma_volatility::ewma_vol;
+pub use self::fs_score::fs_score;

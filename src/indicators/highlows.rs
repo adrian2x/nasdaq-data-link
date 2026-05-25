@@ -50,8 +50,8 @@ pub fn highlows(lf: LazyFrame, windows: &[usize]) -> LazyFrame {
                 ..Default::default()
             };
             [
-                per_ticker(f("low").rolling_min(opts.clone()), &format!("low{w}")),
-                per_ticker(f("high").rolling_max(opts), &format!("high{w}")),
+                per_ticker(f("low").rolling_min(opts.clone()), &format!("min{w}")),
+                per_ticker(f("high").rolling_max(opts), &format!("max{w}")),
             ]
         })
         .collect();

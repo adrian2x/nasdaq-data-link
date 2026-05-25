@@ -2,9 +2,7 @@
 
 use polars::prelude::*;
 
-use crate::indicators::{
-    adx, atr, bollinger, donchian, highlows, macd, percentile, rate_of_change, rsi, sma, sma_expr,
-};
+use crate::indicators::{adr, atr, bollinger, highlows, percentile, rate_of_change, sma, sma_expr};
 
 /// Compute all daily technical indicator columns.
 /// ...
@@ -12,21 +10,21 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     let lf = lf.sort(["ticker", "date"], Default::default());
 
     // Liquidity.
-    let lf = lf.with_columns([
-        sma_expr("volume", 20)
-            .over([col("ticker")])
-            .alias("avgvolume1m"),
-        sma_expr("volume", 50)
-            .over([col("ticker")])
-            .alias("avgvolume3m"),
-    ]);
+    let lf = lf.with_columns([sma_expr("volume", 60)
+        .over([col("ticker")])
+        .alias("avgvolume60")]);
 
     // Price-range features.
-    let lf = highlows(lf, &[252]);
-    let lf = donchian(lf, &[20, 55]);
+    let lf = highlows(lf, &[20, 55, 252]).with_columns([
+        col("close")
+            .gt(col("max252").shift(lit(1)))
+            .alias("high252"),
+        col("close").lt(col("min252").shift(lit(1))).alias("low252"),
+    ]);
 
     // Volatility measures
-    let lf = atr(lf, 14);
+    let lf = adr(lf, 20);
+    let lf = atr(lf, 20);
     let lf = bollinger(lf, 20, 2.0);
 
     // Time-series and cross-sectional momentum
@@ -41,8 +39,5 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     let lf = percentile(lf, "rs1y", "date", true, "rs1y");
 
     // Trend / oscillator indicators.
-    let lf = sma(lf, "close", &[10, 20, 50, 100, 150, 200]);
-    let lf = macd(lf, 12, 26, 9);
-    let lf = rsi(lf, 14);
-    adx(lf, 14)
+    sma(lf, "close", &[10, 20, 50, 100, 150, 200])
 }
