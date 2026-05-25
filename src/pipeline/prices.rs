@@ -4,12 +4,12 @@
 use anyhow::Result;
 
 use polars::prelude::*;
-use crate::filetools::scan_dataset;
+use crate::filetools::read_csv;
 
 /// Load raw stock prices and adjust OHLC values using `closeadj / close`.
 /// Keeps only the adjusted OHLCV columns used downstream.
 pub fn load_prices_adjusted() -> Result<LazyFrame> {
-    let lf = scan_dataset(
+    let lf = read_csv(
         "stocks_eod",
         Some(&[
             ("open", DataType::Float64),

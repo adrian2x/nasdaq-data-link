@@ -76,17 +76,13 @@ pub fn extract_zip_file<P: AsRef<Path>>(zip_path: P) -> Result<String> {
     Ok(output_filename)
 }
 
-/// Convert `downloads/<name>.csv.zip` to `downloads/<name>.parquet`.
+/// Convert extracted `downloads/<name>.csv` to `downloads/<name>.parquet`.
 pub fn dataset_to_parquet(
     name: &str,
     schema_overrides: Option<&[(&str, DataType)]>,
 ) -> Result<String> {
-    let zip_path = format!("{DOWNLOADS_DIR}/{name}.csv.zip");
+    let csv_path = format!("{DOWNLOADS_DIR}/{name}.csv");
     let parquet_path = format!("{DOWNLOADS_DIR}/{name}.parquet");
-
-    let csv_path = with_spinner(&format!("extracting {name}"), || {
-        extract_zip_file(&zip_path)
-    })?;
     with_spinner(&format!("converting {name} to parquet"), || {
         csv_to_parquet(&csv_path, &parquet_path, schema_overrides)
     })?;
@@ -94,7 +90,7 @@ pub fn dataset_to_parquet(
 }
 
 /// Build parquet for a dataset and return a lazy parquet scan.
-pub fn scan_dataset(
+pub fn read_csv(
     name: &str,
     schema_overrides: Option<&[(&str, DataType)]>,
 ) -> Result<LazyFrame> {
@@ -219,7 +215,7 @@ pub fn write_arrow_files() -> Result<()> {
 
     for ticker in tickers {
         let file_ticker = sanitize_ticker_for_filename(&ticker);
-        pb.set_message(format!("arrow {ticker}"));
+        pb.set_message(format!("{ticker}.arrow"));
 
         export_arrow(
             &conn,

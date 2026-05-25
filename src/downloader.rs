@@ -6,6 +6,7 @@ use tokio::{fs, io::AsyncWriteExt};
 use crate::{
     api::nasdaq_api_get,
     config::{DOWNLOADS_DIR, PathSpec},
+    filetools::extract_zip_file,
     ui::new_progress_bar,
 };
 
@@ -64,6 +65,27 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
     if let Err(e) = file.flush().await {
         eprintln!("✗ {} -> flush failed: {}", path, e);
         return false;
+    }
+
+    let is_zip = filepath
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false);
+    if is_zip {
+        let zip_path = filepath.clone();
+        let extracted = tokio::task::spawn_blocking(move || extract_zip_file(&zip_path)).await;
+        match extracted {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("✗ {} -> extract failed: {}", path, e);
+                return false;
+            }
+            Err(e) => {
+                eprintln!("✗ {} -> extract task failed: {}", path, e);
+                return false;
+            }
+        }
     }
     true
 }

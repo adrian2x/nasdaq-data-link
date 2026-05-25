@@ -2,7 +2,7 @@ use crate::indicators::{ewma_vol, realized_volatility, yang_zhang};
 use anyhow::Result;
 use polars::prelude::*;
 
-use crate::filetools::{df_to_duckdb, lf_to_duckdb, scan_dataset, write_arrow_files};
+use crate::filetools::{df_to_duckdb, lf_to_duckdb, read_csv, write_arrow_files};
 use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::pipeline::{
     adjust_fundamentals, build_company_snapshot, load_prices_adjusted, technical_indicators_daily,
@@ -38,7 +38,7 @@ fn write_stocks() -> Result<LazyFrame> {
 }
 
 fn write_financials() -> Result<LazyFrame> {
-    let df = scan_dataset("financials_ttm", None)?;
+    let df = read_csv("financials_ttm", None)?;
 
     let financials_adj = adjust_fundamentals(df);
     with_spinner("writing financials_ttm", || {
@@ -48,7 +48,7 @@ fn write_financials() -> Result<LazyFrame> {
 }
 
 fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
-    let companies = scan_dataset("companies", None)?;
+    let companies = read_csv("companies", None)?;
     let snapshot = build_company_snapshot(companies, prices, financials);
 
     with_spinner("writing companies", || lf_to_duckdb(snapshot, "companies"))?;
@@ -57,7 +57,7 @@ fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
 }
 
 fn write_insiders() -> Result<()> {
-    let df = scan_dataset("insiders", Some(&[("formtype", DataType::String)]))?;
+    let df = read_csv("insiders", Some(&[("formtype", DataType::String)]))?;
 
     let insiders_adj = update_insiders(df);
     with_spinner("writing insiders", || {
