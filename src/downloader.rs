@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::{path::PathBuf, sync::Arc, time::Instant};
+use tokio::{fs, io::AsyncWriteExt};
 
 use crate::{
     api::nasdaq_api_get,
     config::{DOWNLOADS_DIR, PathSpec},
-    filetools::save_file,
     ui::new_progress_bar,
 };
 
@@ -16,7 +16,7 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         output,
     } = spec;
 
-    let response = match nasdaq_api_get(&path, &api_key, query.as_ref()).await {
+    let mut stream = match nasdaq_api_get(&path, &api_key, query.as_ref()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("✗ {} -> download failed: {}", path, e);
@@ -32,8 +32,37 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         }
     };
 
-    if let Err(e) = save_file(&response.body, &filepath) {
-        eprintln!("✗ {} -> save failed: {}", path, e);
+    if let Some(parent) = filepath.parent() {
+        if let Err(e) = fs::create_dir_all(parent).await {
+            eprintln!("✗ {} -> mkdir failed: {}", path, e);
+            return false;
+        }
+    }
+
+    let mut file = match fs::File::create(&filepath).await {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("✗ {} -> save failed: {}", path, e);
+            return false;
+        }
+    };
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("✗ {} -> stream read failed: {}", path, e);
+                return false;
+            }
+        };
+        if let Err(e) = file.write_all(&chunk).await {
+            eprintln!("✗ {} -> write failed: {}", path, e);
+            return false;
+        }
+    }
+
+    if let Err(e) = file.flush().await {
+        eprintln!("✗ {} -> flush failed: {}", path, e);
         return false;
     }
     true

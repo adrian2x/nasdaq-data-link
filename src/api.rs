@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use futures::Stream;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -96,12 +97,64 @@ const MAX_RETRIES: u32 = 3;
 const INITIAL_TIMEOUT: u64 = 60;
 
 const DOWNLOAD_TIMEOUT: u64 = 600;
+async fn http_get_response(
+    url: &str,
+    headers: Option<&HashMap<String, String>>,
+    query: Option<&HashMap<String, String>>,
+    retries: u32,
+    timeout_secs: u64,
+) -> Result<reqwest::Response> {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("Failed to create HTTP client")
+    });
+
+    for attempt in 1..=retries {
+        let mut request_builder = client.get(url).timeout(Duration::from_secs(timeout_secs));
+
+        if let Some(headers_map) = headers {
+            for (key, value) in headers_map {
+                request_builder = request_builder.header(key, value);
+            }
+        }
+
+        if let Some(query_map) = query {
+            request_builder = request_builder.query(query_map);
+        }
+
+        match request_builder.send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) if attempt == retries => {
+                return Err(anyhow!(
+                    "HTTP request failed with status {} after {} attempts",
+                    response.status(),
+                    retries
+                ));
+            }
+            Err(e) if attempt == retries => {
+                return Err(anyhow!("Request failed after {} attempts: {}", retries, e));
+            }
+            _ => {}
+        }
+
+        if attempt < retries {
+            let delay_secs = 2_u64.pow(attempt - 1);
+            sleep(Duration::from_secs(delay_secs)).await;
+        }
+    }
+
+    unreachable!("Loop should have returned or errored")
+}
 
 pub async fn nasdaq_api_get(
     path: &str,
     api_key: &str,
     query: Option<&HashMap<String, String>>,
-) -> Result<HttpResponse> {
+) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let base_url = format!("{}/{}", NASDAQ_BASE_URL, path);
 
     let mut query_params = HashMap::with_capacity(2 + query.as_ref().map_or(0, |q| q.len()));
@@ -183,8 +236,8 @@ pub async fn nasdaq_api_get(
             }
         };
 
-        match http_get(download_url, None, None, 3, DOWNLOAD_TIMEOUT).await {
-            Ok(zip_resp) => return Ok(zip_resp),
+        match http_get_response(download_url, None, None, 3, DOWNLOAD_TIMEOUT).await {
+            Ok(zip_resp) => return Ok(zip_resp.bytes_stream()),
             Err(e) if attempt == MAX_RETRIES => {
                 return Err(anyhow!(
                     "Failed to download zip file after {} attempts: {}",
