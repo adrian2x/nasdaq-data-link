@@ -1,8 +1,11 @@
 use anyhow::Result;
 use polars::prelude::*;
+use crate::indicators::realized_volatility;
 
-use crate::indicators::technical_indicators_daily;
-use crate::pipeline::{adjust_fundamentals, adjust_prices, update_insiders};
+use crate::pipeline::{
+    adjust_fundamentals, adjust_prices, build_company_snapshot, technical_indicators_daily,
+    update_insiders,
+};
 use crate::filetools::{lf_to_duckdb, scan_dataset, write_arrow_files};
 use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::ui::with_spinner;
@@ -26,6 +29,7 @@ fn write_stocks() -> Result<LazyFrame> {
         with_hurst(prices_df, HurstConfig::default()).map_err(anyhow::Error::from)
     })?;
     let df = technical_indicators_daily(prices_with_hurst.lazy());
+    let df = realized_volatility(df, "close", 252, &[5, 21, 63, 252]);
     with_spinner("writing stock_prices", || {
         lf_to_duckdb(df.clone(), "stock_prices")
     })?;
@@ -45,64 +49,7 @@ fn write_financials() -> Result<LazyFrame> {
 
 fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
     let companies = scan_dataset("companies", None)?;
-
-    let active = companies.filter(col("isdelisted").eq(lit("N"))).drop([
-        "table",
-        "permaticker",
-        "isdelisted",
-        "cusips",
-        "sicsector",
-        "sicindustry",
-        "figi",
-        "famaindustry",
-        "scalemarketcap",
-        "scalerevenue",
-        "relatedtickers",
-        "lastupdated",
-        "firstadded",
-        "firstpricedate",
-        "lastpricedate",
-        "firstquarter",
-        "lastquarter",
-    ]);
-
-    let latest_financials = financials
-        .with_column(
-            col("calendardate")
-                .max()
-                .over([col("ticker")])
-                .alias("__max_calendardate"),
-        )
-        .filter(col("calendardate").eq(col("__max_calendardate")))
-        .drop(["__max_calendardate"])
-        .group_by([col("ticker")])
-        .agg([all().last()]);
-
-    let latest_prices = prices
-        .with_column(col("date").max().over([lit(1)]).alias("__max_date"))
-        .filter(col("date").eq(col("__max_date")))
-        .drop(["__max_date"])
-        .group_by([col("ticker")])
-        .agg([all().last()]);
-
-    let joined = active
-        .join(
-            latest_financials,
-            [col("ticker")],
-            [col("ticker")],
-            JoinArgs::new(JoinType::Inner),
-        )
-        .join(
-            latest_prices,
-            [col("ticker")],
-            [col("ticker")],
-            JoinArgs::new(JoinType::Inner),
-        );
-
-    let snapshot = joined.with_columns([
-        (col("shares") * col("close")).alias("marketcap"),
-        (col("shares") * col("close") + col("netdebtusd")).alias("ev"),
-    ]);
+    let snapshot = build_company_snapshot(companies, prices, financials);
 
     with_spinner("writing companies", || lf_to_duckdb(snapshot, "companies"))?;
 
