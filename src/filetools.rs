@@ -1,3 +1,4 @@
+//! Provides file, parquet, and DuckDB helpers for ingestion and writer pipelines.
 use ::zip::ZipArchive;
 use anyhow::{Context, Result, anyhow};
 use arrow::ipc::writer::FileWriter;
@@ -7,9 +8,12 @@ use std::io::copy;
 use std::path::{Path, PathBuf};
 
 use crate::config::{DOWNLOADS_DIR, DUCKDB_FILENAME, OUTPUT_DIR};
-use crate::ui::{new_progress_bar, with_spinner};
+use crate::ui::{new_progress_bar, spinner};
 
-/// Write bytes to a path, creating parent directories when needed.
+/// Writes bytes to a path, creating parent directories when needed.
+///
+/// # Failure
+/// Returns an error if parent directories cannot be created or the file cannot be written.
 pub fn save_file(data: &[u8], filepath: impl AsRef<Path>) -> Result<()> {
     let filepath = filepath.as_ref();
     let path = filepath;
@@ -29,7 +33,10 @@ pub fn save_file(data: &[u8], filepath: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a directory exists.
+/// Ensures a directory exists.
+///
+/// # Failure
+/// Returns an error if the directory cannot be created.
 pub fn ensure_directory(dir: impl AsRef<Path>) -> Result<()> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)
@@ -37,7 +44,10 @@ pub fn ensure_directory(dir: impl AsRef<Path>) -> Result<()> {
     Ok(())
 }
 
-/// Stream CSV to parquet.
+/// Converts a CSV file to parquet.
+///
+/// # Failure
+/// Returns an error if the CSV cannot be read or the parquet output cannot be written.
 pub fn csv_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     csv_path: P,
     parquet_path: Q,
@@ -59,7 +69,10 @@ pub fn csv_to_parquet<P: AsRef<Path>, Q: AsRef<Path>>(
     Ok(())
 }
 
-/// Extract the first ZIP entry next to the archive and return its path.
+/// Extracts the first ZIP entry next to the archive and returns its path.
+///
+/// # Failure
+/// Returns an error if the archive cannot be opened, read, or written out.
 pub fn extract_zip_file<P: AsRef<Path>>(zip_path: P) -> Result<String> {
     let zip_path = zip_path.as_ref();
     let zip_str = zip_path.to_string_lossy();
@@ -76,32 +89,36 @@ pub fn extract_zip_file<P: AsRef<Path>>(zip_path: P) -> Result<String> {
     Ok(output_filename)
 }
 
-/// Convert extracted `downloads/<name>.csv` to `downloads/<name>.parquet`.
+/// Converts `downloads/<name>.csv` to `downloads/<name>.parquet`.
+///
+/// # Failure
+/// Returns an error if conversion from CSV to parquet fails.
 pub fn dataset_to_parquet(
     name: &str,
     schema_overrides: Option<&[(&str, DataType)]>,
 ) -> Result<String> {
     let csv_path = format!("{DOWNLOADS_DIR}/{name}.csv");
     let parquet_path = format!("{DOWNLOADS_DIR}/{name}.parquet");
-    with_spinner(&format!("converting {name} to parquet"), || {
+    spinner!(
+        &format!("converting {name} to parquet"),
         csv_to_parquet(&csv_path, &parquet_path, schema_overrides)
-    })?;
+    )?;
     Ok(parquet_path)
 }
 
-/// Build parquet for a dataset and return a lazy parquet scan.
-pub fn read_csv(
-    name: &str,
-    schema_overrides: Option<&[(&str, DataType)]>,
-) -> Result<LazyFrame> {
+/// Builds parquet for a dataset and returns a lazy parquet scan.
+///
+/// # Failure
+/// Returns an error if conversion fails or if the parquet scan cannot be initialized.
+pub fn read_csv(name: &str, schema_overrides: Option<&[(&str, DataType)]>) -> Result<LazyFrame> {
     let parquet_path = dataset_to_parquet(name, schema_overrides)?;
-    with_spinner(&format!("scanning {name}"), || {
-        LazyFrame::scan_parquet(&parquet_path, ScanArgsParquet::default())
-            .map_err(anyhow::Error::from)
-    })
+    LazyFrame::scan_parquet(&parquet_path, ScanArgsParquet::default()).map_err(anyhow::Error::from)
 }
 
-/// Materialize a LazyFrame to parquet and register it in DuckDB.
+/// Materializes a `LazyFrame` to parquet and registers it in DuckDB.
+///
+/// # Failure
+/// Returns an error if collection, parquet writing, or DuckDB registration fails.
 pub fn lf_to_duckdb(lf: LazyFrame, table: &str) -> Result<()> {
     let table = table.trim();
     if table.is_empty() {
@@ -131,6 +148,10 @@ pub fn lf_to_duckdb(lf: LazyFrame, table: &str) -> Result<()> {
     Ok(())
 }
 
+/// Writes an in-memory `DataFrame` to parquet and registers it as a DuckDB table.
+///
+/// # Failure
+/// Returns an error if parquet writing or DuckDB registration fails.
 pub fn df_to_duckdb(df: &mut DataFrame, table: &str) -> Result<()> {
     let table = table.trim();
     if table.is_empty() {
@@ -189,6 +210,10 @@ fn export_arrow(conn: &duckdb::Connection, query: &str, path: &Path) -> Result<(
     Ok(())
 }
 
+/// Exports table-level and per-ticker Arrow files from DuckDB outputs.
+///
+/// # Failure
+/// Returns an error if querying DuckDB or writing Arrow files fails.
 pub fn write_arrow_files() -> Result<()> {
     let arrow_dir = PathBuf::from(OUTPUT_DIR).join("arrow");
     std::fs::create_dir_all(&arrow_dir)?;

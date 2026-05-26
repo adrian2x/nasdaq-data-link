@@ -1,3 +1,4 @@
+//! Downloads configured NASDAQ bulk datasets concurrently.
 use anyhow::{Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -90,6 +91,10 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
     true
 }
 
+/// Downloads all configured datasets and extracts ZIP payloads.
+///
+/// # Failure
+/// Returns an error if any download task fails.
 pub async fn run_downloader(api_key: &str, specs: Vec<PathSpec>) -> Result<()> {
     let start = Instant::now();
     println!("=== NASDAQ Data Downloader ===");

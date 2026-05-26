@@ -1,33 +1,28 @@
+//! Builds company snapshots by joining active companies with latest prices and fundamentals.
 use polars::prelude::*;
 
+/// Builds the `companies` snapshot with latest fundamental and price-derived fields.
 pub fn build_company_snapshot(
     companies: LazyFrame,
     prices: LazyFrame,
     financials: LazyFrame,
 ) -> LazyFrame {
-    let active = companies.filter(col("isdelisted").eq(lit("N"))).drop([
-        "table",
-        "permaticker",
-        "isdelisted",
-        "cusips",
-        "sicsector",
-        "sicindustry",
-        "figi",
-        "famaindustry",
-        "scalemarketcap",
-        "scalerevenue",
-        "relatedtickers",
-        "lastupdated",
-        "firstadded",
-        "firstpricedate",
-        "lastpricedate",
-        "firstquarter",
-        "lastquarter",
+    let companies = companies.filter(col("isdelisted").eq(lit("N"))).select([
+        col("ticker"),
+        col("name"),
+        col("companysite"),
+        col("location"),
+        col("currency"),
+        col("exchange"),
+        col("category"),
+        col("sector"),
+        col("industry"),
+        col("secfilings"),
+        col("cusips"),
     ]);
 
     let latest_financials = financials
         .select([
-            // Metadata
             col("ticker"),
             col("calendardate"),
             col("reportperiod"),
@@ -95,49 +90,39 @@ pub fn build_company_snapshot(
             col("roic"),
             col("roce"),
             col("grossmargin"),
+            col("ebitdausd"),
             col("ebitdamargin"),
-            col("shyield"),
+            col("bbyield"),
             col("revenue1y"),
-            col("revenue3y"),
-            col("revenue5y"),
             col("revenuecagr3y"),
-            col("revenuecagr5y"),
+            col("revenue5y"),
             col("ebitda1y"),
-            col("ebitda3y"),
-            col("ebitda5y"),
             col("ebitdacagr3y"),
-            col("ebitdacagr5y"),
             col("eps1y"),
-            col("eps3y"),
-            col("eps5y"),
             col("epscagr3y"),
-            col("epscagr5y"),
             col("fcf1y"),
-            col("fcf3y"),
-            col("fcf5y"),
             col("fcfcagr3y"),
-            col("fcfcagr5y"),
             col("fsscore"),
         ])
         .with_column(
             col("calendardate")
                 .max()
                 .over([col("ticker")])
-                .alias("__max_calendardate"),
+                .alias("maxcalendardate"),
         )
-        .filter(col("calendardate").eq(col("__max_calendardate")))
-        .drop(["__max_calendardate"])
+        .filter(col("calendardate").eq(col("maxcalendardate")))
+        .drop(["maxcalendardate"])
         .group_by([col("ticker")])
         .agg([all().last()]);
 
     let latest_prices = prices
-        .with_column(col("date").max().over([lit(1)]).alias("__max_date"))
-        .filter(col("date").eq(col("__max_date")))
-        .drop(["__max_date"])
+        .with_column(col("date").max().over([lit(1)]).alias("maxdate"))
+        .filter(col("date").eq(col("maxdate")))
+        .drop(["maxdate"])
         .group_by([col("ticker")])
         .agg([all().last()]);
 
-    active
+    companies
         .join(
             latest_financials,
             [col("ticker")],

@@ -1,3 +1,4 @@
+//! Loads runtime configuration for API credentials and dataset path specs.
 use anyhow::{Result, anyhow};
 use std::{
     collections::HashMap,
@@ -28,6 +29,10 @@ fn prompt(message: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Loads the NASDAQ API key from `.env`, prompting and persisting it when missing.
+///
+/// # Failure
+/// Returns an error if reading from stdin or flushing stdout fails.
 pub fn load_or_create_api_key() -> Result<String> {
     if Path::new(ENV_FILE).exists() {
         dotenv::dotenv().ok();
@@ -111,6 +116,10 @@ fn parse_path_line(line: &str) -> Option<PathSpec> {
     })
 }
 
+/// Parses `paths.txt` into download path specifications.
+///
+/// # Failure
+/// Returns an error if `paths.txt` cannot be read or contains no valid entries.
 pub fn load_path_specs() -> Result<Vec<PathSpec>> {
     let paths_content = std::fs::read_to_string(PATHS_FILE).map_err(|e| {
         anyhow!(

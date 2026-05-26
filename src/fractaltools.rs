@@ -1,3 +1,4 @@
+//! Computes Hurst-exponent series for per-ticker OHLCV data.
 use polars::prelude::*;
 use rayon::prelude::*;
 use std::time::Instant;
@@ -25,6 +26,10 @@ impl Default for HurstConfig {
     }
 }
 
+/// Computes a Hurst series from OHLCV data, returning one value per input row.
+///
+/// # Failure
+/// Returns an error if required columns are missing or cannot be converted to expected dtypes.
 pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
     let start = Instant::now();
     let n_rows = df.height();
@@ -62,6 +67,10 @@ pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
     Ok(Series::new("hurst".into(), hurst_out))
 }
 
+/// Computes Hurst exponent values and appends them as a `hurst` column.
+///
+/// # Failure
+/// Returns an error if Hurst computation fails or the produced series length is invalid.
 pub fn with_hurst(mut df: DataFrame, cfg: HurstConfig) -> PolarsResult<DataFrame> {
     let hurst = compute_hurst(&df, cfg)?;
     if hurst.len() != df.height() {

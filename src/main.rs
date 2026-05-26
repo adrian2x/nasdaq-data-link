@@ -1,10 +1,11 @@
+//! Runs the NASDAQ dataset download and output-table build pipeline.
 mod api;
 mod config;
-mod indicators;
-mod pipeline;
 mod downloader;
 mod filetools;
 mod fractaltools;
+mod indicators;
+mod pipeline;
 mod sqltools;
 mod ui;
 mod writer;
@@ -14,9 +15,6 @@ use filetools::ensure_directory;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let v: String =
-        duckdb::Connection::open_in_memory()?.query_row("SELECT version()", [], |r| r.get(0))?;
-    println!("DuckDB engine: {v}");
     ensure_directory(config::DOWNLOADS_DIR)?;
     ensure_directory(config::OUTPUT_DIR)?;
 

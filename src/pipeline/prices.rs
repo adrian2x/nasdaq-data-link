@@ -20,8 +20,10 @@ pub fn load_prices_adjusted() -> Result<LazyFrame> {
             ("volume", DataType::Float64),
         ]),
     )?;
+    // Adjusts the historical prices by splits and corporate events
     let adjustment_factor =
         col("closeadj").cast(DataType::Float64) / col("close").cast(DataType::Float64);
+    // Returns the adjusted historical prices with typed values
     Ok(lf.select([
         col("ticker"),
         col("date").cast(DataType::Date),

@@ -1,3 +1,4 @@
+//! Provides HTTP and NASDAQ API clients for the downloader pipeline.
 use anyhow::{Result, anyhow};
 use futures::Stream;
 use reqwest::Client;
@@ -14,12 +15,20 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Decodes the response body as UTF-8 text.
+    ///
+    /// # Failure
+    /// Returns an error if the body is not valid UTF-8.
     pub fn into_text(self) -> Result<String> {
         String::from_utf8(self.body)
             .map_err(|e| anyhow!("Failed to convert bytes to UTF-8 string: {}", e))
     }
 }
 
+/// Performs a GET request with optional headers and query parameters.
+///
+/// # Failure
+/// Returns an error if all retry attempts fail or the response body cannot be read.
 pub async fn http_get(
     url: &str,
     headers: Option<&HashMap<String, String>>,
@@ -150,6 +159,10 @@ async fn http_get_response(
     unreachable!("Loop should have returned or errored")
 }
 
+/// Resolves a NASDAQ datatable export URL and returns a ZIP byte stream.
+///
+/// # Failure
+/// Returns an error if export metadata retrieval or ZIP download fails after retries.
 pub async fn nasdaq_api_get(
     path: &str,
     api_key: &str,
@@ -255,6 +268,10 @@ pub async fn nasdaq_api_get(
     unreachable!("Loop should have returned or errored")
 }
 
+/// Fetches and saves a Logo.dev image for the given ticker symbol.
+///
+/// # Failure
+/// Returns an error if the format is invalid, credentials are missing, or network or file I/O fails.
 pub async fn get_logodev_api(
     symbol: &str,
     size: Option<u32>,

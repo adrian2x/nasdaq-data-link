@@ -1,4 +1,4 @@
-use crate::indicators::{ewma_vol, realized_volatility, yang_zhang};
+//! Builds derived output tables and Arrow exports.
 use anyhow::Result;
 use polars::prelude::*;
 
@@ -8,65 +8,68 @@ use crate::pipeline::{
     adjust_fundamentals, build_company_snapshot, load_prices_adjusted, technical_indicators_daily,
     update_insiders,
 };
-use crate::ui::with_spinner;
+use crate::ui::{spinner, timed};
 
+/// Writes the stock_prices table with price history and derived indicators
 fn write_stocks() -> Result<LazyFrame> {
     // load_prices_adjusted guarantees rows sorted by (ticker, date).
     // Downstream `over("ticker")` rolling computations depend on this.
-    let prices = load_prices_adjusted()?;
+    let priceslf = load_prices_adjusted()?;
+    let priceslf = technical_indicators_daily(priceslf);
+    let pricesdf = spinner!("applying indicators", priceslf.collect())?;
 
-    let df = technical_indicators_daily(prices);
-    // let df = realized_volatility(df, "close", 252, &[5, 21, 63, 252]);
-    // let df = yang_zhang(df, 21, 252.0)?;
-    // let df = ewma_vol(df, 0.94, 252.0)?;
+    // Computes the Hurst exponent and adds the "hurst" column to the df
+    let mut pricesdf = timed!(
+        "computing hurst",
+        with_hurst(pricesdf, HurstConfig::default())
+    )?;
 
-    let df = with_spinner("applying indicators", || {
-        df.collect().map_err(anyhow::Error::from)
-    })?;
+    // Writes to the "stock_prices" table
+    timed!(
+        "writing stock_prices",
+        df_to_duckdb(&mut pricesdf, "stock_prices")
+    )?;
 
-    let mut df = with_spinner("computing hurst", || {
-        with_hurst(df, HurstConfig::default()).map_err(anyhow::Error::from)
-    })?;
-
-    // with_hurst already returns a materialized DataFrame — write it
-    // directly rather than re-lazying and forcing another collect.
-    with_spinner("writing stock_prices", || {
-        df_to_duckdb(&mut df, "stock_prices")
-    })?;
-
-    Ok(df.lazy())
+    Ok(pricesdf.lazy())
 }
 
+/// Writes the financials_ttm table using
 fn write_financials() -> Result<LazyFrame> {
-    let df = read_csv("financials_ttm", None)?;
+    let financialslf = read_csv("financials_ttm", None)?;
+    let financialslf = adjust_fundamentals(financialslf);
 
-    let financials_adj = adjust_fundamentals(df);
-    with_spinner("writing financials_ttm", || {
-        lf_to_duckdb(financials_adj.clone(), "financials_ttm")
-    })?;
-    Ok(financials_adj)
+    timed!(
+        "writing financials_ttm",
+        lf_to_duckdb(financialslf.clone(), "financials_ttm")
+    )?;
+
+    Ok(financialslf)
 }
 
+/// Writes the companies table including latest price and fundamental data
 fn write_companies(prices: LazyFrame, financials: LazyFrame) -> Result<()> {
-    let companies = read_csv("companies", None)?;
-    let snapshot = build_company_snapshot(companies, prices, financials);
+    let companieslf = read_csv("companies", None)?;
+    let companieslf = build_company_snapshot(companieslf, prices, financials);
 
-    with_spinner("writing companies", || lf_to_duckdb(snapshot, "companies"))?;
+    timed!("writing companies", lf_to_duckdb(companieslf, "companies"))?;
 
     Ok(())
 }
 
+/// Writes the insider transactions table
 fn write_insiders() -> Result<()> {
-    let df = read_csv("insiders", Some(&[("formtype", DataType::String)]))?;
+    let insiderslf = read_csv("insiders", Some(&[("formtype", DataType::String)]))?;
+    let insiderslf = update_insiders(insiderslf);
 
-    let insiders_adj = update_insiders(df);
-    with_spinner("writing insiders", || {
-        lf_to_duckdb(insiders_adj, "insiders")
-    })?;
+    timed!("writing insiders", lf_to_duckdb(insiderslf, "insiders"))?;
+
     Ok(())
 }
 
-/// Build all output tables from downloaded datasets.
+/// Builds all output tables from downloaded datasets.
+///
+/// # Failure
+/// Returns an error if any pipeline stage or write step fails.
 pub fn run_writer() -> Result<()> {
     let prices = write_stocks()?;
     let financials = write_financials()?;

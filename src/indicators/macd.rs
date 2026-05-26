@@ -5,61 +5,37 @@
 
 use polars::prelude::*;
 
-/// Cast a column to Float64.
+/// Casts the column `name` to `Float64`.
 fn f(name: &str) -> Expr {
     col(name).cast(DataType::Float64)
 }
 
-/// Span-based exponential moving average expression.
-fn ema_expr(source: &str, span: usize) -> Expr {
-    f(source).ewm_mean(EWMOptions {
+/// Builds a span-based exponential moving average expression
+/// (`alpha = 2 / (span + 1)`).
+fn ema_expr(source: Expr, span: usize) -> Expr {
+    source.ewm_mean(EWMOptions {
         alpha: 2.0 / (span as f64 + 1.0),
         min_periods: span,
         ..Default::default()
     })
 }
 
-/// MACD line: fast EMA minus slow EMA of close.
-pub fn macd_line_expr(fast: usize, slow: usize) -> Expr {
-    ema_expr("close", fast) - ema_expr("close", slow)
-}
-
-/// Add MACD columns to `lf`.
+/// Adds the MACD columns `macd` and `macd_signal` to `lf`.
 ///
-/// With the default (12, 26, 9) parameters the columns are `ema12`, `ema26`,
-/// `macd`, `macdsignal`; non-default parameters get suffixed names so several
-/// MACD configurations can coexist.
+/// `macd` is the fast-minus-slow EMA of close; `macd_signal` is the EMA of
+/// the MACD line over `signal` periods. The fast and slow EMAs are computed
+/// internally and not materialized as columns.
 pub fn macd(lf: LazyFrame, fast: usize, slow: usize, signal: usize) -> LazyFrame {
-    let is_default = fast == 12 && slow == 26 && signal == 9;
-    let (ema_fast_col, ema_slow_col, macd_col, signal_col) = if is_default {
-        (
-            "ema12".to_string(),
-            "ema26".to_string(),
-            "macd".to_string(),
-            "macdsignal".to_string(),
-        )
-    } else {
-        (
-            format!("ema{fast}"),
-            format!("ema{slow}"),
-            format!("macd_{fast}_{slow}"),
-            format!("macdsignal_{fast}_{slow}_{signal}"),
-        )
-    };
+    // MACD line: difference of the fast and slow close EMAs. The two EMAs
+    // exist only inside this expression — they are never their own columns.
+    let macd_line = ema_expr(f("close"), fast) - ema_expr(f("close"), slow);
 
-    // Signal is computed in a second wave because it depends on `macd_col`.
-    lf.with_columns([
-        ema_expr("close", fast)
+    lf
+        // Wave 1: materialize the MACD line. It must be a real column because
+        // the signal line below is an EMA computed *from* it.
+        .with_columns([macd_line.over([col("ticker")]).alias("macd")])
+        // Wave 2: signal line — EMA of the now-materialized `macd` column.
+        .with_columns([ema_expr(col("macd"), signal)
             .over([col("ticker")])
-            .alias(ema_fast_col.as_str()),
-        ema_expr("close", slow)
-            .over([col("ticker")])
-            .alias(ema_slow_col.as_str()),
-        macd_line_expr(fast, slow)
-            .over([col("ticker")])
-            .alias(macd_col.as_str()),
-    ])
-    .with_columns([ema_expr(macd_col.as_str(), signal)
-        .over([col("ticker")])
-        .alias(signal_col.as_str())])
+            .alias("macd_signal")])
 }
