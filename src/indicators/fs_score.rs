@@ -91,7 +91,7 @@ pub fn fs_score(lf: LazyFrame) -> LazyFrame {
         //    (a proxy for AA's net-equity-issuance variable). A distressed
         //    firm raising external equity signals it cannot fund itself
         //    internally.
-        + test(f("shares").lt_eq(lag("shares")))
+        + test(f("shareswadil").lt_eq(lag("shareswadil")))
 
         // --- Recent operational improvements: are the trends improving? ---
 

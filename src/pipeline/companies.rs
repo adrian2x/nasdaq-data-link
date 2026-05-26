@@ -41,12 +41,11 @@ pub fn build_company_snapshot(
             col("intexp"),
             col("taxexp"),
             col("netincdis"),
-            col("consolinc"),
-            col("netincnci"),
+            col("netinc"),
             col("netincadj"),
-            col("prefdivis"),
             col("netinccmn"),
-            col("shares"),
+            col("sharesbas"),
+            col("sharesdil"),
             col("dps"),
             // Cash Flow Statement
             col("capex"),
@@ -152,7 +151,7 @@ pub fn build_company_snapshot(
             JoinArgs::new(JoinType::Inner),
         )
         .with_columns([
-            (col("shares") * col("close")).alias("marketcap"),
-            (col("shares") * col("close") + col("netdebtusd")).alias("ev"),
+            (col("sharesbas") * col("close")).alias("marketcap"),
+            (col("sharesbas") * col("close") + col("netdebtusd")).alias("ev"),
         ])
 }

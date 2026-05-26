@@ -46,7 +46,8 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
         .with_columns([col("calendardate").cast(DataType::Date)])
         .drop(["dimension", "lastupdated"])
         .with_columns([
-            (f("sharesbas") * f("sharefactor")).alias("shares"),
+            (f("sharesbas") * f("sharefactor")).alias("sharesbas"),
+            (f("shareswadil") * f("sharefactor")).alias("sharesdil"),
             (f("ncfo") / f("fxusd")).alias("ncfousd"),
             (f("fcf") / f("fxusd")).alias("fcfusd"),
             (f("assets") - f("liabilities")).alias("equity"),
@@ -104,24 +105,26 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
                 .round(3)
                 .alias("de")
                 .cast(DataType::Float32),
-            (f("netincadj") / f("shares")).alias("epsadj"),
+            (f("netincadj") / f("sharesdil")).alias("epsadj"),
             (lit(100.0) * f("shreturnusd") / f("marketcap"))
                 .round(1)
                 .alias("shyield")
                 .cast(DataType::Float32),
         ])
         .sort(["ticker", "calendardate"], Default::default())
-        // `shift`-based metrics require sorted time order.
+        // Calculate "Owner Earnings" using the Buffett method
         .with_columns({
             let fcfadj = (f("ncfo")
+                // Discontinued operations adjustment
                 - f("netincdis")
-                - f("depamor")
-                - (f("workingcapital") - f("workingcapital").shift(lit(1))).over([col("ticker")])
-                - f("sbcomp"))
+                // Adjust for non-cash charges adjustment
+                - (f("depamor") + f("sbcomp"))
+                // Add back changes in working capital adjustment
+                - (f("workingcapital") - f("workingcapital").shift(lit(1))).over([col("ticker")]))
                 / f("fxusd");
             [
                 fcfadj.clone().alias("fcfadj"),
-                (fcfadj / f("shares")).alias("fcfpsadj"),
+                (fcfadj / f("sharesdil")).alias("fcfpsadj"),
             ]
         })
         // Per-share growth metrics. The per-share basis (dividing by shares)
@@ -133,7 +136,7 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
         // `{item}cagr{n}y` true CAGR, null when an endpoint is <= 0
         //                  (`cagr_expr`); no 1y CAGR — it equals 1y growth.
         .with_columns({
-            let ebitda = f("ebitdausd") / f("shares");
+            let ebitda = f("ebitdausd") / f("sharesdil");
             let eps = f("epsadj");
             let fcfps = f("fcfpsadj");
             [
