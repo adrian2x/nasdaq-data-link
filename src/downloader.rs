@@ -1,11 +1,17 @@
 //! Downloads configured NASDAQ bulk datasets concurrently.
 use anyhow::{Result, anyhow};
-use futures::stream::{FuturesUnordered, StreamExt};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use futures::stream::{self, FuturesUnordered, StreamExt};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
 use tokio::{fs, io::AsyncWriteExt};
 
 use crate::{
-    api::nasdaq_api_get,
+    api::{get_logodev_api, nasdaq_api_get},
     config::{DOWNLOADS_DIR, PathSpec},
     filetools::extract_zip_file,
     ui::new_progress_bar,
@@ -135,4 +141,50 @@ pub async fn run_downloader(api_key: &str, specs: Vec<PathSpec>) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Reads `downloads/companies.csv` and downloads logos for each ticker concurrently.
+///
+/// # Failure
+/// Returns an error when `companies.csv` is missing/invalid.
+pub async fn run_logo_downloader() -> Result<()> {
+    let file = File::open("downloads/companies.csv")?;
+    let mut lines = BufReader::new(file).lines();
+
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("downloads/companies.csv is empty"))?;
+    let ticker_index = header
+        .split(',')
+        .position(|column| column.trim() == "ticker")
+        .ok_or_else(|| anyhow!("'ticker' column not found in downloads/companies.csv"))?;
+
+    stream::iter(lines)
+        .for_each_concurrent(Some(64), move |line_result| async move {
+            let line = match line_result {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("Failed to read CSV line: {e}");
+                    return;
+                }
+            };
+
+            let Some(ticker) = line
+                .split(',')
+                .nth(ticker_index)
+                .map(str::trim)
+                .filter(|ticker| !ticker.is_empty())
+            else {
+                return;
+            };
+
+            print!("https://img.logo.dev/ticker/{}", ticker);
+            if let Err(e) = get_logodev_api(ticker, Some(100), Some("webp")).await {
+                eprintln!("Failed to fetch logo for {ticker}: {e}");
+            }
+        })
+        .await;
+
+    Ok(())
 }

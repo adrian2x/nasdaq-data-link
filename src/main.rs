@@ -17,12 +17,17 @@ use filetools::ensure_directory;
 async fn main() -> Result<()> {
     ensure_directory(config::DOWNLOADS_DIR)?;
     ensure_directory(config::OUTPUT_DIR)?;
+    let api_key = config::load_or_create_api_key()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if std::env::args().skip(1).any(|arg| arg == "--sync") {
+    if args.iter().any(|arg| arg == "--sync") {
         return writer::run_writer();
     }
 
-    let api_key = config::load_or_create_api_key()?;
+    if args.iter().any(|arg| arg == "--logos") {
+        return downloader::run_logo_downloader().await;
+    }
+
     let specs = config::load_path_specs()?;
     downloader::run_downloader(&api_key, specs).await?;
     writer::run_writer()
