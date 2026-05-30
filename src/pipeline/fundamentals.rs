@@ -75,6 +75,13 @@ fn safe_div(numerator: Expr, denominator: Expr) -> Expr {
     finite(numerator / denominator)
 }
 
+/// Uses `secondary` only when `primary` is null.
+fn fallback(primary: Expr, secondary: Expr) -> Expr {
+    when(primary.clone().is_not_null())
+        .then(primary)
+        .otherwise(secondary)
+}
+
 /// Rescales `fraction` to a percentage (`100 * fraction`) and finalizes it at
 /// 1 decimal place. The argument may itself be a division; non-finite
 /// results (e.g. division by zero) become null.
@@ -368,7 +375,8 @@ fn with_period_ranks(lf: LazyFrame, ranks: &[PeriodRankSpec]) -> LazyFrame {
 /// The philosophy is "rank the business, not just the stock chart." Every
 /// component first becomes a report-date cross-sectional percentile via
 /// `with_period_ranks`, then related components are blended into readable
-/// scores:
+/// scores. Component rank columns are retained in the output so consumers can
+/// reconstitute or reweight any composite.
 ///
 /// - `qualrank`: durable quality. High returns on capital, strong margins,
 ///   cash conversion, accrual quality, low leverage, liquidity, and reinvestment
@@ -439,64 +447,83 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     )
     .otherwise(lit(NULL));
 
-    // All raw ingredients are ranked together in one batched pass. Temporary
-    // prefixes identify the score family:
-    // `__q_` quality, `__v_` value, `__e_` EPS proxy, `__s_` SMR,
-    // and `__m_` fundamental momentum.
+    let revenuecagr3y_source = fallback(f("revenuecagr3y"), f("revenue1y"));
+    let revenuecagr5y_source = fallback(f("revenuecagr5y"), revenuecagr3y_source.clone());
+    let ebitdacagr3y_source = fallback(f("ebitdacagr3y"), f("ebitda1y"));
+    let ebitdacagr5y_source = fallback(f("ebitdacagr5y"), ebitdacagr3y_source.clone());
+    let salesassetscagr3y_source = fallback(f("salesassetscagr3y"), f("salesassets1y"));
+    let grossprofitassetscagr3y_source =
+        fallback(f("grossprofitassetscagr3y"), f("grossprofitassets1y"));
+    let opprofitassetscagr3y_source = fallback(f("opprofitassetscagr3y"), f("opprofitassets1y"));
+    let rndcagr3y_source = fallback(f("rndcagr3y"), f("rnd1y"));
+
+    // All raw ingredients are ranked together in one batched pass. Rank aliases
+    // are public component columns so downstream consumers can reconstitute the
+    // composites or apply their own weights.
     let ranks = [
-        period_rank(f("roic"), "__q_roic", true, true),
-        period_rank(f("roce"), "__q_roce", true, true),
-        period_rank(f("roe"), "__q_roe", true, true),
-        period_rank(f("grossmargin"), "__q_grossmargin", true, true),
-        period_rank(f("ebitdamargin"), "__q_ebitdamargin", true, true),
-        period_rank(f("ebitmargin"), "__q_ebitmargin", true, true),
-        period_rank(f("revenuecagr3y"), "__q_revenuecagr3y", true, true),
-        period_rank(f("revenuecagr5y"), "__q_revenuecagr5y", true, true),
-        period_rank(f("salesassetscagr3y"), "__q_salesassetscagr3y", true, true),
+        period_rank(f("roic"), "roicrank", true, true),
+        period_rank(f("roce"), "rocerank", true, true),
+        period_rank(f("roe"), "roerank", true, true),
+        period_rank(f("grossmargin"), "grossmarginrank", true, true),
+        period_rank(f("ebitdamargin"), "ebitdamarginrank", true, true),
+        period_rank(f("ebitmargin"), "ebitmarginrank", true, true),
         period_rank(
-            f("grossprofitassetscagr3y"),
-            "__q_grossprofitassetscagr3y",
+            revenuecagr3y_source.clone(),
+            "revenuecagr3yrank",
+            true,
+            true,
+        ),
+        period_rank(revenuecagr5y_source, "revenuecagr5yrank", true, true),
+        period_rank(
+            salesassetscagr3y_source,
+            "salesassetscagr3yrank",
             true,
             true,
         ),
         period_rank(
-            f("opprofitassetscagr3y"),
-            "__q_opprofitassetscagr3y",
+            grossprofitassetscagr3y_source,
+            "grossprofitassetscagr3yrank",
             true,
             true,
         ),
-        period_rank(f("rndintensity"), "__q_rndintensity", true, true),
-        period_rank(f("rndcagr3y"), "__q_rndcagr3y", true, true),
-        period_rank(f("cfc"), "__q_cfc", true, true),
-        period_rank(f("fcfassets"), "__q_fcfassets", true, true),
-        period_rank(f("cashaccruals"), "__q_cashaccruals", true, true),
-        period_rank(f("icr"), "__q_icr", true, true),
-        period_rank(f("de"), "__q_de", false, true),
-        period_rank(f("fsscore"), "__q_fsscore", true, true),
-        period_rank(f("cashassets"), "__q_cashassets", true, true),
-        period_rank(f("intangiblesassets"), "__q_intangiblesassets", true, true),
-        period_rank(ev_ebitda, "__v_ev_ebitda", false, true),
-        period_rank(ev_sales, "__v_ev_sales", false, true),
-        period_rank(ebitda_peg, "__v_ebitda_peg", false, true),
-        period_rank(f("ebitda1y"), "__e_ebitda1y", true, true),
-        period_rank(f("ebitdaaccel"), "__e_ebitdaaccel", true, true),
-        period_rank(f("ebitdacagr3y"), "__e_ebitdacagr3y", true, true),
-        period_rank(f("ebitdacagr5y"), "__e_ebitdacagr5y", true, true),
-        period_rank(f("revenue1y"), "__s_revenue1y", true, true),
-        period_rank(f("revenueaccel"), "__m_revenueaccel", true, true),
+        period_rank(
+            opprofitassetscagr3y_source,
+            "opprofitassetscagr3yrank",
+            true,
+            true,
+        ),
+        period_rank(f("rndintensity"), "rndintensityrank", true, true),
+        period_rank(rndcagr3y_source, "rndcagr3yrank", true, true),
+        period_rank(f("cfc"), "cfcrank", true, true),
+        period_rank(f("fcfassets"), "fcfassetsrank", true, true),
+        period_rank(f("cashaccruals"), "cashaccrualsrank", true, true),
+        period_rank(f("icr"), "icrrank", true, true),
+        period_rank(f("de"), "derank", false, true),
+        period_rank(f("fsscore"), "fsscorerank", true, true),
+        period_rank(f("cashassets"), "cashassetsrank", true, true),
+        period_rank(f("intangiblesassets"), "intangiblesassetsrank", true, true),
+        period_rank(ev_ebitda, "evebitdarank", false, true),
+        period_rank(ev_sales, "evsalesrank", false, true),
+        period_rank(ebitda_peg, "ebitdapegrank", false, true),
+        period_rank(f("ebitda1y"), "ebitda1yrank", true, true),
+        period_rank(f("ebitdaaccel"), "ebitdaaccelrank", true, true),
+        period_rank(ebitdacagr3y_source.clone(), "ebitdacagr3yrank", true, true),
+        period_rank(ebitdacagr5y_source, "ebitdacagr5yrank", true, true),
+        period_rank(f("revenue1y"), "revenue1yrank", true, true),
+        period_rank(f("revenueaccel"), "revenueaccelrank", true, true),
         period_rank(
             f("grossmarginexpansion"),
-            "__m_grossmarginexpansion",
+            "grossmarginexpansionrank",
             true,
             true,
         ),
         period_rank(
             f("ebitdamarginexpansion"),
-            "__m_ebitdamarginexpansion",
+            "ebitdamarginexpansionrank",
             true,
             true,
         ),
-        period_rank(f("roicexpansion"), "__m_roicexpansion", true, true),
+        period_rank(f("roicexpansion"), "roicexpansionrank", true, true),
     ];
     let lf = with_period_ranks(lf, &ranks);
 
@@ -508,26 +535,26 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     // interest coverage, leverage, liquidity, and reinvestment proxies so the
     // rank does not simply become a growth-at-any-price score.
     let quality_weighted = [
-        ("__q_roic", 0.08),
-        ("__q_roce", 0.08),
-        ("__q_roe", 0.06),
-        ("__q_grossmargin", 0.06),
-        ("__q_ebitmargin", 0.06),
-        ("__q_revenuecagr3y", 0.04),
-        ("__q_revenuecagr5y", 0.04),
-        ("__q_salesassetscagr3y", 0.04),
-        ("__q_grossprofitassetscagr3y", 0.04),
-        ("__q_opprofitassetscagr3y", 0.04),
-        ("__q_rndintensity", 0.025),
-        ("__q_rndcagr3y", 0.025),
-        ("__q_cfc", 0.05),
-        ("__q_fcfassets", 0.05),
-        ("__q_cashaccruals", 0.05),
-        ("__q_icr", 0.04),
-        ("__q_de", 0.04),
-        ("__q_fsscore", 0.04),
-        ("__q_cashassets", 0.03),
-        ("__q_intangiblesassets", 0.03),
+        ("roicrank", 0.08),
+        ("rocerank", 0.08),
+        ("roerank", 0.06),
+        ("grossmarginrank", 0.06),
+        ("ebitmarginrank", 0.06),
+        ("revenuecagr3yrank", 0.04),
+        ("revenuecagr5yrank", 0.04),
+        ("salesassetscagr3yrank", 0.04),
+        ("grossprofitassetscagr3yrank", 0.04),
+        ("opprofitassetscagr3yrank", 0.04),
+        ("rndintensityrank", 0.025),
+        ("rndcagr3yrank", 0.025),
+        ("cfcrank", 0.05),
+        ("fcfassetsrank", 0.05),
+        ("cashaccrualsrank", 0.05),
+        ("icrrank", 0.04),
+        ("derank", 0.04),
+        ("fsscorerank", 0.04),
+        ("cashassetsrank", 0.03),
+        ("intangiblesassetsrank", 0.03),
     ];
 
     // Value rank weights.
@@ -537,9 +564,9 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     // leg avoids giving the best rank to statistically cheap businesses whose
     // EBITDA is not growing.
     let value_weighted = [
-        ("__v_ev_ebitda", 1.0 / 3.0),
-        ("__v_ev_sales", 1.0 / 3.0),
-        ("__v_ebitda_peg", 1.0 / 3.0),
+        ("evebitdarank", 1.0 / 3.0),
+        ("evsalesrank", 1.0 / 3.0),
+        ("ebitdapegrank", 1.0 / 3.0),
     ];
 
     // EPS rank proxy.
@@ -551,10 +578,10 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     // intentionally favors 1Y growth and quarter-over-quarter acceleration over
     // older CAGR history.
     let eps_weighted = [
-        ("__e_ebitda1y", 0.4),
-        ("__e_ebitdaaccel", 0.3),
-        ("__e_ebitdacagr3y", 0.2),
-        ("__e_ebitdacagr5y", 0.1),
+        ("ebitda1yrank", 0.4),
+        ("ebitdaaccelrank", 0.3),
+        ("ebitdacagr3yrank", 0.2),
+        ("ebitdacagr5yrank", 0.1),
     ];
 
     // SMR rank proxy: Sales + Margins + Returns.
@@ -563,11 +590,11 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     // Margins, and Return on Equity. We use revenue growth for Sales,
     // gross/EBITDA margins for Margins, and ROE for Returns.
     let smr_weighted = [
-        ("__s_revenue1y", 0.25),
-        ("__q_revenuecagr3y", 0.15),
-        ("__q_grossmargin", 0.15),
-        ("__q_ebitdamargin", 0.2),
-        ("__q_roe", 0.25),
+        ("revenue1yrank", 0.25),
+        ("revenuecagr3yrank", 0.15),
+        ("grossmarginrank", 0.15),
+        ("ebitdamarginrank", 0.2),
+        ("roerank", 0.25),
     ];
 
     // Fundamental momentum rank.
@@ -580,11 +607,11 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
     // published Composite inputs do not include a distinct fundamental-momentum
     // factor.
     let fundamental_momentum_weighted = [
-        ("__m_revenueaccel", 0.25),
-        ("__e_ebitdaaccel", 0.25),
-        ("__m_grossmarginexpansion", 0.15),
-        ("__m_ebitdamarginexpansion", 0.2),
-        ("__m_roicexpansion", 0.15),
+        ("revenueaccelrank", 0.25),
+        ("ebitdaaccelrank", 0.25),
+        ("grossmarginexpansionrank", 0.15),
+        ("ebitdamarginexpansionrank", 0.2),
+        ("roicexpansionrank", 0.15),
     ];
 
     lf.with_columns([
@@ -594,7 +621,6 @@ fn fundamental_rankings(lf: LazyFrame) -> LazyFrame {
         weighted_percentile_score(&smr_weighted, "smrrank"),
         weighted_percentile_score(&fundamental_momentum_weighted, "fmomrank"),
     ])
-    .drop(ranks.iter().map(|rank| rank.alias).collect::<Vec<_>>())
 }
 
 /// Transforms raw fundamentals into analysis columns.
@@ -808,9 +834,13 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
                 // Growth idea of looking beyond plain revenue growth: sales,
                 // gross profit, and operating profit should rise relative to
                 // the asset base, not only by consuming more capital.
+                pct_change(f("assetturnover"), 4).alias("salesassets1y"),
                 cagr(f("assetturnover"), 3).alias("salesassetscagr3y"),
+                pct_change(safe_div(f("gp"), assets_safe.clone()), 4).alias("grossprofitassets1y"),
                 cagr(safe_div(f("gp"), assets_safe.clone()), 3).alias("grossprofitassetscagr3y"),
+                pct_change(safe_div(f("opinc"), assets_safe.clone()), 4).alias("opprofitassets1y"),
                 cagr(safe_div(f("opinc"), assets_safe.clone()), 3).alias("opprofitassetscagr3y"),
+                pct_change(safe_div(f("rnd"), f("fxusd")), 4).alias("rnd1y"),
                 cagr(safe_div(f("rnd"), f("fxusd")), 3).alias("rndcagr3y"),
             ]
         });
@@ -862,6 +892,26 @@ mod tests {
             .collect()?;
 
         assert_eq!(Vec::from(out.column("value")?.f64()?), &[Some(5.0), None]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cagr_fallback_uses_5y_then_3y_then_1y() -> PolarsResult<()> {
+        let df = df![
+            "cagr5y" => [Some(5.0), None, None, None],
+            "cagr3y" => [Some(3.0), Some(3.0), None, None],
+            "growth1y" => [Some(1.0), Some(1.0), Some(1.0), None],
+        ]?;
+        let out = df
+            .lazy()
+            .select([fallback(f("cagr5y"), fallback(f("cagr3y"), f("growth1y"))).alias("value")])
+            .collect()?;
+
+        assert_eq!(
+            Vec::from(out.column("value")?.f64()?),
+            &[Some(5.0), Some(3.0), Some(1.0), None]
+        );
 
         Ok(())
     }

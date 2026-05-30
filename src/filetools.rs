@@ -276,19 +276,10 @@ pub fn write_arrow_files() -> Result<()> {
             "SELECT date, open, high, low, close, volume \
                  FROM stock_prices \
                  WHERE ticker = ? \
-                 ORDER BY date",
+                   AND date > CAST(CAST(now() AS TIMESTAMP) - INTERVAL '5 years' AS DATE) \
+                 ORDER BY date ASC",
             [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_prices.arrow")),
-        )?;
-
-        export_arrow(
-            &conn,
-            "SELECT date, open, high, low, close, volume \
-                 FROM stock_prices_weekly \
-                 WHERE ticker = ? \
-                 ORDER BY date",
-            [ticker.as_str()],
-            &arrow_dir.join(format!("{file_ticker}_weekly.arrow")),
         )?;
 
         pb.inc(1);
