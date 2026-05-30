@@ -13,8 +13,9 @@ bytes = "1.10"
 zip = "0.6"
 dotenv = "0.15"
 futures = "0.3"
-indicatif = "0.17"
-polars = { version = "0.46", features = ["lazy", "csv", "decompress", "rolling_window", "round_series", "abs", "log", "ewma", "ipc", "parquet", "is_in", "semi_anti_join", "partition_by", "rank", "dynamic_group_by", "streaming"] }
+console = "0.16"
+indicatif = "0.18"
+polars = { version = "0.46", features = ["lazy", "csv", "decompress", "rolling_window", "round_series", "abs", "log", "ewma", "ipc", "parquet", "is_in", "semi_anti_join", "partition_by", "rank", "dynamic_group_by", "asof_join", "streaming"] }
 duckdb = { version = "1.10502", features = ["bundled"] }
 arrow = { version = "58.3.0", default-features = false, features = ["ipc"] }
 chrono = { version = "0.4", default-features = true }

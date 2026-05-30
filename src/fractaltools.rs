@@ -1,7 +1,6 @@
 //! Computes Hurst-exponent series for per-ticker OHLCV data.
 use polars::prelude::*;
 use rayon::prelude::*;
-use std::time::Instant;
 
 #[derive(Clone, Copy)]
 pub struct HurstConfig {
@@ -31,7 +30,6 @@ impl Default for HurstConfig {
 /// # Failure
 /// Returns an error if required columns are missing or cannot be converted to expected dtypes.
 pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
-    let start = Instant::now();
     let n_rows = df.height();
     if n_rows == 0 {
         return Ok(Series::new("hurst".into(), Vec::<f64>::new()));
@@ -44,17 +42,21 @@ pub fn compute_hurst(df: &DataFrame, cfg: HurstConfig) -> PolarsResult<Series> {
     let volume = f64_to_vec(df, "volume")?;
     let dates = date_col_to_i64(df.column("date")?)?;
 
-    let group_indices: Vec<Vec<u32>> = group_row_indices_by_ticker(df)?;
+    let group_indices = group_row_indices_by_ticker(df)?;
 
     let scales = build_scales(&cfg);
+    let inputs = HurstInputs {
+        dates: &dates,
+        open: &open,
+        high: &high,
+        low: &low,
+        close: &close,
+        volume: &volume,
+    };
 
     let hurst_per_group: Vec<Vec<(u32, f64)>> = group_indices
-        .par_iter()
-        .map(|indices| {
-            process_ticker(
-                indices, &dates, &open, &high, &low, &close, &volume, &cfg, &scales,
-            )
-        })
+        .into_par_iter()
+        .map(|indices| process_ticker(indices, &inputs, &cfg, &scales))
         .collect();
 
     let mut hurst_out = vec![f64::NAN; n_rows];
@@ -129,24 +131,26 @@ fn group_row_indices_by_ticker(df: &DataFrame) -> PolarsResult<Vec<Vec<u32>>> {
     Ok(buckets.into_values().collect())
 }
 
+struct HurstInputs<'a> {
+    dates: &'a [i64],
+    open: &'a [f64],
+    high: &'a [f64],
+    low: &'a [f64],
+    close: &'a [f64],
+    volume: &'a [f64],
+}
+
 fn process_ticker(
-    indices: &[u32],
-    dates: &[i64],
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
+    mut sorted_idx: Vec<u32>,
+    inputs: &HurstInputs<'_>,
     cfg: &HurstConfig,
     scales: &[usize],
 ) -> Vec<(u32, f64)> {
-    let mut sorted_idx: Vec<u32> = indices.to_vec();
-
     let already_sorted = sorted_idx
         .windows(2)
-        .all(|w| dates[w[0] as usize] <= dates[w[1] as usize]);
+        .all(|w| inputs.dates[w[0] as usize] <= inputs.dates[w[1] as usize]);
     if !already_sorted {
-        sorted_idx.sort_unstable_by_key(|&i| dates[i as usize]);
+        sorted_idx.sort_unstable_by_key(|&i| inputs.dates[i as usize]);
     }
 
     let len = sorted_idx.len();
@@ -154,7 +158,7 @@ fn process_ticker(
         return sorted_idx.into_iter().map(|i| (i, f64::NAN)).collect();
     }
 
-    let signal = build_composite_indexed(&sorted_idx, open, high, low, close, volume, cfg);
+    let signal = build_composite_indexed(&sorted_idx, inputs, cfg);
     let hurst = rolling_hurst(&signal, cfg, scales);
 
     sorted_idx.into_iter().zip(hurst).collect()
@@ -241,11 +245,7 @@ fn date_col_to_i64(col: &Column) -> PolarsResult<Vec<i64>> {
 
 fn build_composite_indexed(
     sorted_idx: &[u32],
-    open: &[f64],
-    high: &[f64],
-    low: &[f64],
-    close: &[f64],
-    volume: &[f64],
+    inputs: &HurstInputs<'_>,
     cfg: &HurstConfig,
 ) -> Vec<f64> {
     let n = sorted_idx.len();
@@ -263,13 +263,13 @@ fn build_composite_indexed(
 
     let mut prev_close: f64 = f64::NAN;
 
-    for i in 0..n {
-        let orig = sorted_idx[i] as usize;
-        let o = open[orig];
-        let h = high[orig];
-        let l = low[orig];
-        let c = close[orig];
-        let v = volume[orig];
+    for (i, &idx) in sorted_idx.iter().enumerate() {
+        let orig = idx as usize;
+        let o = inputs.open[orig];
+        let h = inputs.high[orig];
+        let l = inputs.low[orig];
+        let c = inputs.close[orig];
+        let v = inputs.volume[orig];
 
         let gk = if o > 0.0 && l > 0.0 && h > 0.0 && c > 0.0 {
             let hl = (h / l).ln();
@@ -365,16 +365,15 @@ impl DfaScratch {
     }
 }
 
-fn dfa1_from_profile(
-    profile: &[f64],
-    ps: &[f64],
-    pss: &[f64],
-    pks: &[f64],
-    scales: &[usize],
-    reverse_pass: bool,
-    log_s: &mut Vec<f64>,
-    log_f: &mut Vec<f64>,
-) -> f64 {
+fn dfa1_from_profile(scratch: &mut DfaScratch, scales: &[usize], reverse_pass: bool) -> f64 {
+    let DfaScratch {
+        profile,
+        ps,
+        pss,
+        pks,
+        log_s,
+        log_f,
+    } = scratch;
     let n = profile.len();
     log_s.clear();
     log_f.clear();
@@ -395,19 +394,27 @@ fn dfa1_from_profile(
         if denom_x <= 0.0 {
             continue;
         }
+        let box_stats = BoxStats {
+            ps,
+            pss,
+            pks,
+            sx,
+            denom_x,
+            sf,
+        };
 
         let mut ss_total = 0.0_f64;
         let mut count_total = 0usize;
 
         for b in 0..n_boxes {
             let a = b * s;
-            ss_total += box_ss(a, s, ps, pss, pks, sx, denom_x, sf);
+            ss_total += box_ss(a, s, &box_stats);
             count_total += s;
         }
         if reverse_pass {
             for b in 0..n_boxes {
                 let a = n - (b + 1) * s;
-                ss_total += box_ss(a, s, ps, pss, pks, sx, denom_x, sf);
+                ss_total += box_ss(a, s, &box_stats);
                 count_total += s;
             }
         }
@@ -437,25 +444,25 @@ fn dfa1_from_profile(
     (m * sxy - sx * sy) / denom
 }
 
-#[inline(always)]
-fn box_ss(
-    a: usize,
-    s: usize,
-    ps: &[f64],
-    pss: &[f64],
-    pks: &[f64],
+struct BoxStats<'a> {
+    ps: &'a [f64],
+    pss: &'a [f64],
+    pks: &'a [f64],
     sx: f64,
     denom_x: f64,
     sf: f64,
-) -> f64 {
+}
+
+#[inline(always)]
+fn box_ss(a: usize, s: usize, stats: &BoxStats<'_>) -> f64 {
     let end = a + s;
-    let sy = ps[end] - ps[a];
-    let syy = pss[end] - pss[a];
-    let sky = pks[end] - pks[a]; // sum_{j in box} j * P[j], j is global index
+    let sy = stats.ps[end] - stats.ps[a];
+    let syy = stats.pss[end] - stats.pss[a];
+    let sky = stats.pks[end] - stats.pks[a]; // sum_{j in box} j * P[j], j is global index
     let sxy = sky - (a as f64) * sy; // shift x = j - a
 
-    let num = sxy - sx * sy / sf;
-    let ss = syy - sy * sy / sf - num * num / denom_x;
+    let num = sxy - stats.sx * sy / stats.sf;
+    let ss = syy - sy * sy / stats.sf - num * num / stats.denom_x;
     if ss > 0.0 { ss } else { 0.0 }
 }
 
@@ -491,8 +498,8 @@ fn rolling_hurst(signal: &[f64], cfg: &HurstConfig, scales: &[usize]) -> Vec<f64
         scratch.pss[0] = 0.0;
         scratch.pks[0] = 0.0;
         let mut acc = 0.0_f64;
-        for k in 0..w {
-            acc += win[k] - mean;
+        for (k, &x) in win.iter().enumerate() {
+            acc += x - mean;
             scratch.profile[k] = acc;
             let kf = k as f64;
             scratch.ps[k + 1] = scratch.ps[k] + acc;
@@ -500,16 +507,7 @@ fn rolling_hurst(signal: &[f64], cfg: &HurstConfig, scales: &[usize]) -> Vec<f64
             scratch.pks[k + 1] = scratch.pks[k] + kf * acc;
         }
 
-        out[i] = dfa1_from_profile(
-            &scratch.profile,
-            &scratch.ps,
-            &scratch.pss,
-            &scratch.pks,
-            scales,
-            cfg.reverse_pass,
-            &mut scratch.log_s,
-            &mut scratch.log_f,
-        );
+        out[i] = dfa1_from_profile(&mut scratch, scales, cfg.reverse_pass);
     }
 
     out

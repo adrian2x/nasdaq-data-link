@@ -16,9 +16,8 @@ use crate::ui::{new_progress_bar, spinner};
 /// Returns an error if parent directories cannot be created or the file cannot be written.
 pub fn save_file(data: &[u8], filepath: impl AsRef<Path>) -> Result<()> {
     let filepath = filepath.as_ref();
-    let path = filepath;
 
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = filepath.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             anyhow!(
                 "Failed to create directories for '{}': {}",
@@ -28,7 +27,7 @@ pub fn save_file(data: &[u8], filepath: impl AsRef<Path>) -> Result<()> {
         })?;
     }
 
-    std::fs::write(path, data)
+    std::fs::write(filepath, data)
         .map_err(|e| anyhow!("Failed to write file '{}': {}", filepath.display(), e))?;
     Ok(())
 }
@@ -186,12 +185,17 @@ fn sanitize_ticker_for_filename(ticker: &str) -> String {
         .collect()
 }
 
-fn export_arrow(conn: &duckdb::Connection, query: &str, path: &Path) -> Result<()> {
+fn export_arrow<P: duckdb::Params>(
+    conn: &duckdb::Connection,
+    query: &str,
+    params: P,
+    path: &Path,
+) -> Result<()> {
     let mut stmt = conn
         .prepare(query)
         .with_context(|| format!("preparing export query: {query}"))?;
     let batches = stmt
-        .query_arrow([])
+        .query_arrow(params)
         .with_context(|| format!("running export query: {query}"))?;
     let schema = batches.get_schema();
 
@@ -224,6 +228,7 @@ pub fn write_arrow_files() -> Result<()> {
     export_arrow(
         &conn,
         "SELECT * FROM companies",
+        [],
         &arrow_dir.join("companies.arrow"),
     )?;
 
@@ -244,38 +249,46 @@ pub fn write_arrow_files() -> Result<()> {
 
         export_arrow(
             &conn,
-            &format!("SELECT * FROM companies WHERE ticker = '{ticker}' LIMIT 1"),
+            "SELECT * FROM companies WHERE ticker = ? LIMIT 1",
+            [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_metrics.arrow")),
         )?;
 
         export_arrow(
             &conn,
-            &format!(
-                "SELECT * EXCLUDE (ticker) FROM financials_ttm WHERE ticker = '{ticker}' ORDER BY calendardate"
-            ),
+            "SELECT * EXCLUDE (ticker) FROM financials_ttm WHERE ticker = ? ORDER BY calendardate",
+            [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_financials.arrow")),
         )?;
 
         export_arrow(
             &conn,
-            &format!(
-                "SELECT * EXCLUDE (ticker) FROM insiders \
-                 WHERE ticker = '{ticker}' \
+            "SELECT * EXCLUDE (ticker) FROM insiders \
+                 WHERE ticker = ? \
                    AND (transactioncode IS NULL OR transactioncode NOT IN ('M','A','D','J','G','C')) \
-                 ORDER BY date DESC, transactionvalue DESC"
-            ),
+                 ORDER BY date DESC, transactionvalue DESC",
+            [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_insiders.arrow")),
         )?;
 
         export_arrow(
             &conn,
-            &format!(
-                "SELECT date, open, high, low, close, volume \
+            "SELECT date, open, high, low, close, volume \
                  FROM stock_prices \
-                 WHERE ticker = '{ticker}' \
-                 ORDER BY date"
-            ),
+                 WHERE ticker = ? \
+                 ORDER BY date",
+            [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_prices.arrow")),
+        )?;
+
+        export_arrow(
+            &conn,
+            "SELECT date, open, high, low, close, volume \
+                 FROM stock_prices_weekly \
+                 WHERE ticker = ? \
+                 ORDER BY date",
+            [ticker.as_str()],
+            &arrow_dir.join(format!("{file_ticker}_weekly.arrow")),
         )?;
 
         pb.inc(1);

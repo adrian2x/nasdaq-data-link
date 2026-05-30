@@ -4,7 +4,6 @@ use std::{
     collections::HashMap,
     env,
     io::{self, Write},
-    path::Path,
 };
 
 pub const DOWNLOADS_DIR: &str = "downloads";
@@ -14,7 +13,7 @@ pub const DUCKDB_FILENAME: &str = "nasdaq.duckdb";
 const PATHS_FILE: &str = "paths.txt";
 const ENV_FILE: &str = ".env";
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PathSpec {
     pub path: String,
     pub query: Option<HashMap<String, String>>,
@@ -34,13 +33,11 @@ fn prompt(message: &str) -> Result<String> {
 /// # Failure
 /// Returns an error if reading from stdin or flushing stdout fails.
 pub fn load_or_create_api_key() -> Result<String> {
-    if Path::new(ENV_FILE).exists() {
-        dotenv::dotenv().ok();
-        if let Ok(key) = env::var("NASDAQ_API_KEY") {
-            if !key.is_empty() {
-                return Ok(key);
-            }
-        }
+    dotenv::dotenv().ok();
+    if let Ok(key) = env::var("NASDAQ_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
     }
 
     println!("\nNo NASDAQ API key found.");

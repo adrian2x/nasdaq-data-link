@@ -1,17 +1,18 @@
 //! Provides HTTP and NASDAQ API clients for the downloader pipeline.
+use crate::filetools::save_file;
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use futures::Stream;
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 use tokio::time::sleep;
 
 #[derive(Debug)]
 pub struct HttpResponse {
-    pub body: Vec<u8>,
-
-    pub status_code: u16,
+    pub body: Bytes,
 }
 
 impl HttpResponse {
@@ -20,9 +21,43 @@ impl HttpResponse {
     /// # Failure
     /// Returns an error if the body is not valid UTF-8.
     pub fn into_text(self) -> Result<String> {
-        String::from_utf8(self.body)
+        String::from_utf8(self.body.to_vec())
             .map_err(|e| anyhow!("Failed to convert bytes to UTF-8 string: {}", e))
     }
+}
+
+fn http_client() -> &'static Client {
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
+
+fn get_request(
+    url: &str,
+    headers: Option<&[(&str, &str)]>,
+    query: Option<&[(&str, &str)]>,
+    timeout_secs: u64,
+) -> RequestBuilder {
+    let mut request_builder = http_client()
+        .get(url)
+        .timeout(Duration::from_secs(timeout_secs));
+
+    if let Some(headers) = headers {
+        for &(key, value) in headers {
+            request_builder = request_builder.header(key, value);
+        }
+    }
+
+    if let Some(query) = query {
+        request_builder = request_builder.query(query);
+    }
+
+    request_builder
 }
 
 /// Performs a GET request with optional headers and query parameters.
@@ -31,46 +66,18 @@ impl HttpResponse {
 /// Returns an error if all retry attempts fail or the response body cannot be read.
 pub async fn http_get(
     url: &str,
-    headers: Option<&HashMap<String, String>>,
-    query: Option<&HashMap<String, String>>,
+    headers: Option<&[(&str, &str)]>,
+    query: Option<&[(&str, &str)]>,
     retries: u32,
     timeout_secs: u64,
 ) -> Result<HttpResponse> {
-    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("Failed to create HTTP client")
-    });
-
     for attempt in 1..=retries {
-        let mut request_builder = client.get(url).timeout(Duration::from_secs(timeout_secs));
-
-        if let Some(headers_map) = headers {
-            for (key, value) in headers_map {
-                request_builder = request_builder.header(key, value);
-            }
-        }
-
-        if let Some(query_map) = query {
-            request_builder = request_builder.query(query_map);
-        }
-
-        let result = request_builder.send().await;
+        let result = get_request(url, headers, query, timeout_secs).send().await;
 
         match result {
             Ok(response) if response.status().is_success() => {
-                let status_code = response.status().as_u16();
-
                 match response.bytes().await {
-                    Ok(body_bytes) => {
-                        return Ok(HttpResponse {
-                            body: body_bytes.to_vec(),
-                            status_code,
-                        });
-                    }
+                    Ok(body) => return Ok(HttpResponse { body }),
                     Err(e) if attempt == retries => {
                         return Err(anyhow!("Failed to read response body: {}", e));
                     }
@@ -108,34 +115,13 @@ const INITIAL_TIMEOUT: u64 = 60;
 const DOWNLOAD_TIMEOUT: u64 = 600;
 async fn http_get_response(
     url: &str,
-    headers: Option<&HashMap<String, String>>,
-    query: Option<&HashMap<String, String>>,
+    headers: Option<&[(&str, &str)]>,
+    query: Option<&[(&str, &str)]>,
     retries: u32,
     timeout_secs: u64,
 ) -> Result<reqwest::Response> {
-    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .expect("Failed to create HTTP client")
-    });
-
     for attempt in 1..=retries {
-        let mut request_builder = client.get(url).timeout(Duration::from_secs(timeout_secs));
-
-        if let Some(headers_map) = headers {
-            for (key, value) in headers_map {
-                request_builder = request_builder.header(key, value);
-            }
-        }
-
-        if let Some(query_map) = query {
-            request_builder = request_builder.query(query_map);
-        }
-
-        match request_builder.send().await {
+        match get_request(url, headers, query, timeout_secs).send().await {
             Ok(response) if response.status().is_success() => return Ok(response),
             Ok(response) if attempt == retries => {
                 return Err(anyhow!(
@@ -170,12 +156,12 @@ pub async fn nasdaq_api_get(
 ) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let base_url = format!("{}/{}", NASDAQ_BASE_URL, path);
 
-    let mut query_params = HashMap::with_capacity(2 + query.as_ref().map_or(0, |q| q.len()));
-    query_params.insert("api_key".to_string(), api_key.to_string());
-    query_params.insert("qopts.export".to_string(), "true".to_string());
+    let mut query_params = Vec::with_capacity(2 + query.as_ref().map_or(0, |q| q.len()));
+    query_params.push(("api_key", api_key));
+    query_params.push(("qopts.export", "true"));
 
     if let Some(extra_params) = query {
-        query_params.extend(extra_params.iter().map(|(k, v)| (k.clone(), v.clone())));
+        query_params.extend(extra_params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
 
     for attempt in 1..=MAX_RETRIES {
@@ -278,10 +264,10 @@ pub async fn get_logodev_api(
     format: Option<&str>,
 ) -> Result<String> {
     use std::env;
-    use std::path::Path;
 
     let size = size.unwrap_or(100);
     let format = format.unwrap_or("png");
+    let symbol = symbol.to_uppercase();
 
     if format != "png" && format != "webp" {
         return Err(anyhow!(
@@ -296,28 +282,18 @@ pub async fn get_logodev_api(
 
     let url = format!(
         "https://img.logo.dev/ticker/{}?token={}&size={}&fallback=monogram&retina=true&format={}",
-        symbol.to_uppercase(),
-        logo_key,
-        size,
-        format
+        symbol, logo_key, size, format
     );
 
     let response = http_get(&url, None, None, 3, 30)
         .await
         .map_err(|e| anyhow!("Failed to fetch logo for {}: {}", symbol, e))?;
 
-    let logos_dir = "output/logos";
-    let logos_path = Path::new(logos_dir);
-    if !logos_path.exists() {
-        std::fs::create_dir_all(logos_path)
-            .map_err(|e| anyhow!("Failed to create logos directory '{}': {}", logos_dir, e))?;
-    }
+    let filepath = Path::new("output")
+        .join("logos")
+        .join(format!("{symbol}.{format}"));
 
-    let filename = format!("{}.{}", symbol.to_uppercase(), format);
-    let filepath = format!("{}/{}", logos_dir, filename);
+    save_file(response.body.as_ref(), &filepath)?;
 
-    std::fs::write(&filepath, &response.body)
-        .map_err(|e| anyhow!("Failed to save logo to '{}': {}", filepath, e))?;
-
-    Ok(filepath)
+    Ok(filepath.to_string_lossy().into_owned())
 }

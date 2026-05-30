@@ -35,16 +35,20 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
     let filepath = match output {
         Some(name) => PathBuf::from(DOWNLOADS_DIR).join(name),
         None => {
-            let base = path.replace('/', "_").replace(".json", "") + "_data.zip";
+            let base = path
+                .strip_suffix(".json")
+                .unwrap_or(&path)
+                .replace('/', "_")
+                + "_data.zip";
             PathBuf::from(DOWNLOADS_DIR).join(base)
         }
     };
 
-    if let Some(parent) = filepath.parent() {
-        if let Err(e) = fs::create_dir_all(parent).await {
-            eprintln!("✗ {} -> mkdir failed: {}", path, e);
-            return false;
-        }
+    if let Some(parent) = filepath.parent()
+        && let Err(e) = fs::create_dir_all(parent).await
+    {
+        eprintln!("✗ {} -> mkdir failed: {}", path, e);
+        return false;
     }
 
     let mut file = match fs::File::create(&filepath).await {
@@ -80,8 +84,7 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         .map(|ext| ext.eq_ignore_ascii_case("zip"))
         .unwrap_or(false);
     if is_zip {
-        let zip_path = filepath.clone();
-        let extracted = tokio::task::spawn_blocking(move || extract_zip_file(&zip_path)).await;
+        let extracted = tokio::task::spawn_blocking(move || extract_zip_file(filepath)).await;
         match extracted {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {

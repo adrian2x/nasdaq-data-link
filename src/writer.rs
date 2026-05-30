@@ -5,8 +5,8 @@ use polars::prelude::*;
 use crate::filetools::{df_to_duckdb, lf_to_duckdb, read_csv, write_arrow_files};
 use crate::fractaltools::{HurstConfig, with_hurst};
 use crate::pipeline::{
-    adjust_fundamentals, build_company_snapshot, load_prices_adjusted, technical_indicators_daily,
-    update_insiders,
+    adjust_fundamentals, build_company_snapshot, load_prices_adjusted, resample_ohlcv,
+    technical_indicators_daily, update_insiders,
 };
 use crate::ui::{spinner, timed};
 
@@ -30,7 +30,45 @@ fn write_stocks() -> Result<LazyFrame> {
         df_to_duckdb(&mut pricesdf, "stock_prices")
     )?;
 
-    Ok(pricesdf.lazy())
+    // Companies only need the current price/indicator row. Returning this
+    // small snapshot avoids carrying the full daily history into the company
+    // join after `stock_prices` has already been persisted.
+    let latest_prices = timed!(
+        "preparing latest stock snapshot",
+        pricesdf
+            .lazy()
+            .group_by_stable([col("ticker")])
+            .agg([all().last()])
+            .collect()
+    )?;
+
+    Ok(latest_prices.lazy())
+}
+
+/// Writes weekly stock prices with the same indicators as daily prices.
+fn write_stocks_weekly() -> Result<()> {
+    let priceslf = resample_ohlcv(load_prices_adjusted()?, "1w");
+
+    let priceslf = technical_indicators_daily(priceslf);
+    let pricesdf = spinner!("applying weekly indicators", priceslf.collect())?;
+
+    let mut pricesdf = timed!(
+        "computing weekly hurst",
+        with_hurst(
+            pricesdf,
+            HurstConfig {
+                window: 100,
+                ..HurstConfig::default()
+            },
+        )
+    )?;
+
+    timed!(
+        "writing stock_prices_weekly",
+        df_to_duckdb(&mut pricesdf, "stock_prices_weekly")
+    )?;
+
+    Ok(())
 }
 
 /// Writes the financials_ttm table using
@@ -38,12 +76,14 @@ fn write_financials() -> Result<LazyFrame> {
     let financialslf = read_csv("financials_ttm", None)?;
     let financialslf = adjust_fundamentals(financialslf);
 
+    let mut financialsdf = timed!("applying fundamentals", financialslf.collect())?;
+
     timed!(
         "writing financials_ttm",
-        lf_to_duckdb(financialslf.clone(), "financials_ttm")
+        df_to_duckdb(&mut financialsdf, "financials_ttm")
     )?;
 
-    Ok(financialslf)
+    Ok(financialsdf.lazy())
 }
 
 /// Writes the companies table including latest price and fundamental data
@@ -70,11 +110,14 @@ fn write_insiders() -> Result<()> {
 ///
 /// # Failure
 /// Returns an error if any pipeline stage or write step fails.
-pub fn run_writer() -> Result<()> {
+pub fn run_writer(export_arrow: bool) -> Result<()> {
     let prices = write_stocks()?;
+    write_stocks_weekly()?;
     let financials = write_financials()?;
     write_companies(prices, financials)?;
     write_insiders()?;
-    write_arrow_files()?;
+    if export_arrow {
+        write_arrow_files()?;
+    }
     Ok(())
 }

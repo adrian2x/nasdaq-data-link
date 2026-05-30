@@ -37,8 +37,11 @@ pub fn percentile(
     // n = count of non-null `source` values within the date group.
     let n = col(source).count().over([col(date_col)]);
     let rank = col(source).rank(opts, None).over([col(date_col)]);
+    let percentile = ((rank - lit(1.0)) / (n.clone() - lit(1.0))) * lit(100.0);
 
-    lf.with_columns([(((rank - lit(1.0)) / (n - lit(1.0))) * lit(100.0))
+    lf.with_columns([when(n.gt(lit(1)))
+        .then(percentile)
+        .otherwise(lit(NULL))
         .round(2)
         .alias(alias)
         .cast(DataType::Float32)])
