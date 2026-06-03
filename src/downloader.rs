@@ -1,14 +1,22 @@
 //! Downloads configured NASDAQ bulk datasets concurrently.
-use anyhow::{Result, anyhow};
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use anyhow::{Context, Result, anyhow};
+use bytes::Buf;
+use futures::{
+    TryStream, TryStreamExt,
+    stream::{self, FuturesUnordered, StreamExt},
+};
 use std::{
     fs::File,
-    io::{BufRead, BufReader},
-    path::PathBuf,
+    io::{BufRead, BufReader, Error as IoError},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::{self as tokio_io, AsyncWriteExt, BufWriter},
+};
+use tokio_util::io::StreamReader;
 
 use crate::{
     api::{get_logodev_api, nasdaq_api_get},
@@ -17,6 +25,33 @@ use crate::{
     ui::new_progress_bar,
 };
 
+const STREAM_WRITER_BUFFER_CAPACITY: usize = 64 * 1024;
+
+async fn save_stream<S, B, E>(stream: S, filepath: &Path) -> Result<()>
+where
+    S: TryStream<Ok = B, Error = E> + Unpin,
+    B: Buf,
+    E: std::fmt::Display,
+{
+    let stream = stream.map_err(|e| IoError::other(e.to_string()));
+    let mut reader = StreamReader::new(stream);
+    let file = fs::File::create(filepath)
+        .await
+        .with_context(|| format!("save failed: {}", filepath.display()))?;
+    let mut writer = BufWriter::with_capacity(STREAM_WRITER_BUFFER_CAPACITY, file);
+
+    tokio_io::copy_buf(&mut reader, &mut writer)
+        .await
+        .with_context(|| format!("stream copy failed: {}", filepath.display()))?;
+
+    writer
+        .flush()
+        .await
+        .with_context(|| format!("flush failed: {}", filepath.display()))?;
+
+    Ok(())
+}
+
 async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
     let PathSpec {
         path,
@@ -24,7 +59,7 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         output,
     } = spec;
 
-    let mut stream = match nasdaq_api_get(&path, &api_key, query.as_ref()).await {
+    let stream = match nasdaq_api_get(&path, &api_key, query.as_ref()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("✗ {} -> download failed: {}", path, e);
@@ -51,30 +86,8 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
         return false;
     }
 
-    let mut file = match fs::File::create(&filepath).await {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("✗ {} -> save failed: {}", path, e);
-            return false;
-        }
-    };
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("✗ {} -> stream read failed: {}", path, e);
-                return false;
-            }
-        };
-        if let Err(e) = file.write_all(&chunk).await {
-            eprintln!("✗ {} -> write failed: {}", path, e);
-            return false;
-        }
-    }
-
-    if let Err(e) = file.flush().await {
-        eprintln!("✗ {} -> flush failed: {}", path, e);
+    if let Err(e) = save_stream(stream, &filepath).await {
+        eprintln!("✗ {} -> {}", path, e);
         return false;
     }
 
@@ -105,10 +118,10 @@ async fn download_one(api_key: Arc<str>, spec: PathSpec) -> bool {
 /// # Failure
 /// Returns an error if any download task fails.
 pub async fn run_downloader(api_key: &str, specs: Vec<PathSpec>) -> Result<()> {
-    let start = Instant::now();
     println!("=== NASDAQ Data Downloader ===");
 
     let shared_key: Arc<str> = Arc::from(api_key);
+    let start = Instant::now();
     let mut tasks: FuturesUnordered<_> = specs
         .into_iter()
         .map(|spec| {

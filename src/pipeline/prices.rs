@@ -10,7 +10,7 @@ use polars::prelude::*;
 /// Keeps only the adjusted OHLCV columns used downstream.
 pub fn load_prices_adjusted() -> Result<LazyFrame> {
     let lf = read_csv(
-        "stocks_eod",
+        "stocks_prices",
         Some(&[
             ("open", DataType::Float64),
             ("high", DataType::Float64),

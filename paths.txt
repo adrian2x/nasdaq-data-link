@@ -1,8 +1,7 @@
 SHARADAR/TICKERS.json -q table=SEP -o companies.csv.zip
-SHARADAR/TICKERS.json -q table=SFP -o funds.csv.zip
-SHARADAR/SEP.json -o stocks_eod.csv.zip
-SHARADAR/SFP.json -o funds_eod.csv.zip
+SHARADAR/SEP.json -o stocks_prices.csv.zip
 SHARADAR/INDICATORS.json -q table=SF1,SEP -o indicators.csv.zip
 SHARADAR/METRICS.json -o metrics.csv.zip
 SHARADAR/SF1.json -q dimension=MRT -o financials_ttm.csv.zip
+SHARADAR/SF1.json -q dimension=ARQ -o financials_quarter.csv.zip
 SHARADAR/SF2.json -o insiders.csv.zip

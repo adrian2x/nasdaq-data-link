@@ -227,7 +227,26 @@ pub fn write_arrow_files() -> Result<()> {
 
     export_arrow(
         &conn,
-        "SELECT * FROM companies",
+        r"SELECT ticker,name,exchange,close,pct1 as pct1d,volume,
+        sharesdil,marketcap,sector,industry,avgvolumeusd20 as avgvolumeusd1m,
+        revenue,revenueqtryoy,revenueyoy,revenuecagr3y,revenue5y,
+        ev,ebitda,
+        round(ev/ebitda,1) as evebitda,
+        round(ev/revenue,1) as evsales,
+        round(marketcap/equity,1) as pb,
+        netinc,round(netinc/sharesdil,2) as eps,epsqtr,
+        round(marketcap/netinc,1) as pe,
+        round(marketcap/(netinc*(1+revenueyoy/100)),1) as fwdpe,
+        epsyoy,epscagr3y,epsqtryoy,
+        fcf,fcfyoy,fcfcagr3y,
+        round(marketcap/revenue,1) as ps,round(marketcap/fcf,1) as pfcf,
+        dps,dpscagr5y,round(100*dps/eps,1) as divpayoutratio,
+        roa,roe,roic,de,grossmargin,ebitdamargin,netmargin,
+        pct5 as pct1w,pct21 as pct1m,pct63 as pct3m,pct126 as pct6m,pct252 as pct12m,
+        atr20 as atr,rsi14 as rsi, 
+        sma20,sma50,sma200,max252,min252,
+        qualrank,rsrank,growthrank,momrank,valuerank,rankscore
+        FROM companies",
         [],
         &arrow_dir.join("companies.arrow"),
     )?;
@@ -249,16 +268,19 @@ pub fn write_arrow_files() -> Result<()> {
 
         export_arrow(
             &conn,
-            "SELECT * FROM companies WHERE ticker = ? LIMIT 1",
+            "SELECT fiscalperiod,fcf,netdebt,de,roic,roe, \
+            grossmargin,netmargin
+            FROM financials_ttm WHERE ticker = ? ORDER BY calendardate",
             [ticker.as_str()],
-            &arrow_dir.join(format!("{file_ticker}_metrics.arrow")),
+            &arrow_dir.join(format!("{file_ticker}_ttm.arrow")),
         )?;
 
         export_arrow(
             &conn,
-            "SELECT * EXCLUDE (ticker) FROM financials_ttm WHERE ticker = ? ORDER BY calendardate",
+            "SELECT fiscalperiod,revenue,netincadj as netinc
+            FROM financials_quarter WHERE ticker = ? ORDER BY calendardate",
             [ticker.as_str()],
-            &arrow_dir.join(format!("{file_ticker}_financials.arrow")),
+            &arrow_dir.join(format!("{file_ticker}_quarter.arrow")),
         )?;
 
         export_arrow(
@@ -273,22 +295,12 @@ pub fn write_arrow_files() -> Result<()> {
 
         export_arrow(
             &conn,
-            "SELECT date, open, high, low, close, volume \
+            "SELECT date, close \
                  FROM stock_prices \
                  WHERE ticker = ? \
                  ORDER BY date",
             [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_prices.arrow")),
-        )?;
-
-        export_arrow(
-            &conn,
-            "SELECT date, open, high, low, close, volume \
-                 FROM stock_prices_weekly \
-                 WHERE ticker = ? \
-                 ORDER BY date",
-            [ticker.as_str()],
-            &arrow_dir.join(format!("{file_ticker}_weekly.arrow")),
         )?;
 
         pb.inc(1);

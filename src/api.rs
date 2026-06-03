@@ -112,7 +112,7 @@ const MAX_RETRIES: u32 = 3;
 
 const INITIAL_TIMEOUT: u64 = 60;
 
-const DOWNLOAD_TIMEOUT: u64 = 600;
+const DOWNLOAD_TIMEOUT: u64 = 10 * 60;
 async fn http_get_response(
     url: &str,
     headers: Option<&[(&str, &str)]>,

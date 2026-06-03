@@ -36,15 +36,15 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
 
     let lf = lf.with_column(
         (col("close").cast(DataType::Float64) * col("volume").cast(DataType::Float64))
-            .alias("__dollarvolume"),
+            .alias("volumeusd"),
     );
     let lf = lf.with_columns([
-        sma_expr("__dollarvolume", 20)
+        sma_expr("volumeusd", 20)
             .over([col("ticker")])
-            .alias("avgdollarvolume20"),
-        sma_expr("__dollarvolume", 126)
+            .alias("avgvolumeusd20"),
+        sma_expr("volumeusd", 126)
             .over([col("ticker")])
-            .alias("avgdollarvolume126"),
+            .alias("avgvolumeusd126"),
     ]);
 
     // Computes the price range (high/low) equivalent to approx 1m, 3m, and 1y
@@ -87,13 +87,13 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
 
     let lf = lf.with_column(
         when(
-            col("avgdollarvolume126")
+            col("avgvolumeusd126")
                 .cast(DataType::Float64)
                 .gt(lit(0.0)),
         )
         .then(
-            col("avgdollarvolume20").cast(DataType::Float64)
-                / col("avgdollarvolume126").cast(DataType::Float64)
+            col("avgvolumeusd20").cast(DataType::Float64)
+                / col("avgvolumeusd126").cast(DataType::Float64)
                 - lit(1.0),
         )
         .otherwise(lit(NULL))
@@ -176,7 +176,7 @@ pub fn technical_indicators_daily(lf: LazyFrame) -> LazyFrame {
     // high values mean stronger recent accumulation than peers; low values
     // mean distribution or weak sponsorship.
     let lf = percentile(lf, "__adscore", "date", true, "adrank").drop([
-        "__dollarvolume",
+        "volumeusd",
         "__volconfirm",
         "__prev_close",
         "__adscore",
