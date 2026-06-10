@@ -14,9 +14,9 @@ mod writer;
 
 pub use companies::build_company_snapshot;
 pub use fundamentals_quarter::{
-    adjust_fundamentals_quarter, compute_quarterly_fundamental_metrics,
+    adjust_financials_qtr, financials_qtr_metrics,
 };
-pub use fundamentals_ttm::{adjust_fundamentals, compute_fundamental_metrics};
+pub use fundamentals_ttm::{adjust_financials_ttm, financials_ttm_metrics};
 pub use insiders::update_insiders;
 pub use prices::{load_prices_adjusted, resample_ohlcv};
 pub use technical_analysis::technical_indicators_daily;

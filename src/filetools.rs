@@ -1,5 +1,4 @@
 //! Provides file, parquet, and DuckDB helpers for ingestion and writer pipelines.
-use ::zip::ZipArchive;
 use anyhow::{Context, Result, anyhow};
 use arrow::ipc::writer::FileWriter;
 use polars::prelude::*;
@@ -81,7 +80,7 @@ pub fn extract_zip_file<P: AsRef<Path>>(zip_path: P) -> Result<String> {
         .unwrap_or_else(|| zip_str.to_string());
 
     let zip_file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(zip_file)?;
+    let mut archive = ::zip::ZipArchive::new(zip_file)?;
     let mut csv_file = archive.by_index(0)?;
     let mut output_file = File::create(&output_filename)?;
     copy(&mut csv_file, &mut output_file)?;
@@ -230,26 +229,57 @@ pub fn write_arrow_files() -> Result<()> {
         r"SELECT ticker,name,exchange,close,pct1 as pct1d,volume,
         sharesdil,marketcap,sector,industry,avgvolumeusd20 as avgvolumeusd1m,
         revenue,revenueqtryoy,revenueyoy,revenuecagr3y,revenue5y,
-        ev,ebitda,debt,cashneq as cash,
+        ev,ebitda,ebit,debt,cashneq as cash,netinc,epsqtr,
         round(ev/ebitda,1) as evebitda,
         round(ev/revenue,1) as evsales,
         round(marketcap/equity,1) as pb,
-        netinc,round(netinc/sharesdil,2) as eps,epsqtr,
+        round(netinc/sharesdil,2) as eps,
         round(marketcap/netinc,1) as pe,
-        round(marketcap/(netinc*(1+revenueyoy/100)),1) as fwdpe,
+        round(marketcap/(netinc*epsyoy/100),1) as fwdpe,
         epsyoy,epscagr3y,epsqtryoy,
         fcf,fcfyoy,fcfcagr3y,
-        round(marketcap/revenue,1) as ps,round(marketcap/fcf,1) as pfcf,
-        round((marketcap/netinc)/(revenueyoy+coalesce(dps/close,0)),1) as peg,
-        dps,dpscagr5y,round(100*dps/eps,1) as divpayoutratio,round(100*dps/close,2) as divyield,
+        round(marketcap/revenue,1) as ps,
+        round(marketcap/fcf,1) as pfcf,
+        round((ev/netinc)/(least(epscagr3y,revenuecagr3y,epsyoy,revenueyoy)+coalesce(100*dps/close,0)),1) as peg,
+        dps,dpscagr5y,
+        round(100*dps/close,2) as divyield,
+        round(100*dps/eps,1) as divpayoutratio,
         roa,roe,roic,de,grossmargin,ebitdamargin,netmargin,
         pct5 as pct1w,pct21 as pct1m,pct63 as pct3m,pct126 as pct6m,pct252 as pct12m,
         atr20 as atr,rsi14 as rsi, 
         sma20,sma50,sma200,max252,min252,
-        qualrank,rsrank,growthrank,momrank,valuerank,rankscore
+        qualrank,rsrank,growthrank,momrank,valuerank,rankscore,
+        (revenueqtraccel > 0) as revenuetrend,
+        (epsqtraccel > 0 and epsqtr1qagoyoy > epsqtr2qagoyoy) as epstrend
         FROM companies",
         [],
         &arrow_dir.join("companies.arrow"),
+    )?;
+
+    export_arrow(
+        &conn,
+        "SELECT exchange,ticker,name,close,pct1 as pct1d FROM companies",
+        [],
+        &arrow_dir.join("search.arrow"),
+    )?;
+
+    export_arrow(
+        &conn,
+        r"WITH qualifying_tickers AS (
+            SELECT DISTINCT ticker
+            FROM insiders
+            WHERE date >= CAST(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL '3 months' AS DATE)
+              AND transactioncode = 'P'
+              AND transactionvalue > 100000
+        )
+        SELECT i.*
+        FROM insiders i
+        INNER JOIN qualifying_tickers q ON q.ticker = i.ticker
+        WHERE i.date >= CAST(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL '6 months' AS DATE)
+          AND (i.transactioncode IS NULL OR i.transactioncode NOT IN ('M','A','D','J','G','C'))
+        ORDER BY i.date DESC, i.transactionvalue DESC, i.ticker",
+        [],
+        &arrow_dir.join("insiders.arrow"),
     )?;
 
     let mut stmt = conn
@@ -269,19 +299,39 @@ pub fn write_arrow_files() -> Result<()> {
 
         export_arrow(
             &conn,
-            "SELECT fiscalperiod,fcf,netdebt,de,roic,roe, \
-            grossmargin,netmargin
-            FROM financials_ttm WHERE ticker = ? ORDER BY calendardate",
+            "SELECT ticker,name,exchange,marketcap,
+            netdebt,netinc,fcf,
+            close,pct1 as pct1d,max252 as max1y,min252 as low1y,
+            rankscore,qualrank,growthrank,momrank,valuerank,
+            revenueyoy,revenuecagr3y,epsyoy,epscagr3y,
+            grossmargin,netmargin,de,roe,roic,dps,
+            FROM companies WHERE ticker = ? LIMIT 1",
+            [ticker.as_str()],
+            &arrow_dir.join(format!("{file_ticker}_metrics.arrow")),
+        )?;
+
+        export_arrow(
+            &conn,
+            "SELECT * FROM (
+                SELECT calendardate,fiscalperiod,fcf,netdebt,de,roic,roe,grossmargin,netmargin
+                FROM financials_ttm WHERE ticker = ?
+                ORDER BY calendardate DESC
+                LIMIT 20
+            ) ORDER BY calendardate",
             [ticker.as_str()],
             &arrow_dir.join(format!("{file_ticker}_ttm.arrow")),
         )?;
 
         export_arrow(
             &conn,
-            "SELECT fiscalperiod,revenue,netincadj as netinc
-            FROM financials_quarter WHERE ticker = ? ORDER BY calendardate",
+            "SELECT * FROM (
+                SELECT calendardate,fiscalperiod,revenue,netincadj as netinc
+                FROM financials_qtr WHERE ticker = ?
+                ORDER BY calendardate DESC
+                LIMIT 20
+            ) ORDER BY calendardate",
             [ticker.as_str()],
-            &arrow_dir.join(format!("{file_ticker}_quarter.arrow")),
+            &arrow_dir.join(format!("{file_ticker}_qtr.arrow")),
         )?;
 
         export_arrow(

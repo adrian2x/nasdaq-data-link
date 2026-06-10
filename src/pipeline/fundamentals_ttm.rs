@@ -53,7 +53,7 @@ fn cagr(source: Expr, years: i64) -> Expr {
 }
 
 /// Normalizes raw MRT fundamentals for the persisted `financials_ttm` table.
-pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
+pub fn adjust_financials_ttm(lf: LazyFrame) -> LazyFrame {
     lf.with_columns([
         col("calendardate").cast(DataType::Date),
         col(REPORT_PERIOD).cast(DataType::Date),
@@ -135,6 +135,7 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
         pct(f("grossmargin")).alias("grossmargin"),
         pct(f("netmargin")).alias("netmargin"),
         pct(f("ebitdamargin")).alias("ebitdamargin"),
+        pct(f("ebit") / f("revenue")).alias("ebitmargin"),
         pct(f("ros")).alias("ros"),
         pct(f("payoutratio")).alias("payoutratio"),
         pct(f("divyield")).alias("divyield"),
@@ -164,11 +165,14 @@ pub fn adjust_fundamentals(lf: LazyFrame) -> LazyFrame {
 }
 
 /// Adds derived TTM fundamentals used by company snapshots and snapshot ranks.
-pub fn compute_fundamental_metrics(lf: LazyFrame) -> LazyFrame {
+pub fn financials_ttm_metrics(lf: LazyFrame) -> LazyFrame {
     let lf = lf
         .sort(["ticker", "calendardate"], Default::default())
         .with_columns([
-            pct(safe_div(f("ebit"), f("assets") - f("liabilitiesc"))).alias("roce"),
+            (f("ebit") - f("netincdis")).alias("ebitadj").round(2),
+        ])
+        .with_columns([
+            pct(safe_div(f("ebitadj"), f("assets") - f("liabilitiesc"))).alias("roce"),
             pct(safe_div(f("ebt"), f("revenue"))).alias("pretaxmargin"),
             pct(safe_div(lit(-1.0) * f("ncfcommon"), f("marketcap"))).alias("bbyield"),
             cagr(col("dps"), 5).alias("dpscagr5y"),
@@ -195,12 +199,16 @@ pub fn compute_fundamental_metrics(lf: LazyFrame) -> LazyFrame {
                 pct_change(col("sps"), 4).alias("revenueyoy"),
                 pct_change(col("sps"), 4 * 5).alias("revenue5y"),
                 cagr(col("sps"), 3).alias("revenuecagr3y"),
+                cagr(col("sps"), 5).alias("revenuecagr5y"),
                 pct_change(ebitdaps.clone(), 4).alias("ebitda1y"),
-                cagr(ebitdaps, 3).alias("ebitdacagr3y"),
+                cagr(ebitdaps.clone(), 3).alias("ebitdacagr3y"),
+                cagr(ebitdaps, 5).alias("ebitdacagr5y"),
                 pct_change(eps.clone(), 4).alias("epsyoy"),
                 cagr(eps.clone(), 3).alias("epscagr3y"),
+                cagr(eps.clone(), 5).alias("epscagr5y"),
                 pct_change(fcfps.clone(), 4).alias("fcfyoy"),
-                cagr(fcfps, 3).alias("fcfcagr3y"),
+                cagr(fcfps.clone(), 3).alias("fcfcagr3y"),
+                cagr(fcfps, 5).alias("fcfcagr5y"),
             ]
         });
 

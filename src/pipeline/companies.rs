@@ -36,8 +36,8 @@ use super::rankings::{
 pub fn build_company_snapshot(
     companies: LazyFrame,
     prices: LazyFrame,
-    financials: LazyFrame,
-    financials_quarter: LazyFrame,
+    financials_ttm: LazyFrame,
+    financials_qtr: LazyFrame,
 ) -> LazyFrame {
     let companies = companies.filter(col("isdelisted").eq(lit("N"))).select([
         col("ticker"),
@@ -123,6 +123,9 @@ pub fn build_company_snapshot(
         col("pretaxmargin"),
         col("grossmargin"),
         col("netmargin"),
+        col("ebit"),
+        col("fcfadj"),
+        col("ebitmargin"),
         col("ebitda"),
         col("ebitdamargin"),
         col("revenueyoy"),
@@ -140,14 +143,14 @@ pub fn build_company_snapshot(
     ];
     latest_financial_columns.extend(rafi_feature_columns().iter().map(|name| col(*name)));
 
-    let latest_financials = financials
+    let latest_financials = financials_ttm
         .select(latest_financial_columns)
         // `adjust_fundamentals` sorts by ticker/date before materialization.
         // Taking the last row per ticker avoids a full max-date window scan.
         .group_by_stable([col("ticker")])
         .agg([all().last()]);
 
-    let latest_quarterly_rankings = financials_quarter
+    let latest_quarterly_rankings = financials_qtr
         .select([
             col("ticker"),
             col("revenueqtryoy"),
@@ -193,7 +196,10 @@ pub fn build_company_snapshot(
         )
         .with_columns([
             (col("sharesbas") * col("close")).alias("marketcap"),
-            (col("sharesbas") * col("close") + col("netdebt")).alias("ev"),
+            (col("sharesbas") * col("close") + col("netdebt")).alias("ev")
+        ])
+        .with_columns([
+            ((col("marketcap") / col("netinc")) / col("revenuecagr3y")).alias("peg").round(1)
         ]);
 
     let snapshot = add_rafi_snapshot_ranks(snapshot);

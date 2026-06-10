@@ -3,11 +3,11 @@ use anyhow::Result;
 use polars::prelude::*;
 
 use crate::filetools::{df_to_duckdb, lf_to_duckdb, read_csv, write_arrow_files};
-use crate::indicators::{HurstConfig, with_hurst};
+use crate::indicators::{with_hurst, HurstConfig};
 
 use super::{
-    adjust_fundamentals, adjust_fundamentals_quarter, build_company_snapshot,
-    compute_fundamental_metrics, compute_quarterly_fundamental_metrics, load_prices_adjusted,
+    adjust_financials_ttm, adjust_financials_qtr, build_company_snapshot,
+    financials_ttm_metrics, financials_qtr_metrics, load_prices_adjusted,
     resample_ohlcv, technical_indicators_daily, update_insiders,
 };
 use crate::ui::{spinner, timed};
@@ -69,62 +69,56 @@ fn write_stocks_weekly(compute_hurst: bool) -> Result<DataFrame> {
     Ok(pricesdf)
 }
 
-/// Writes the financials_ttm table using
-fn write_financials() -> Result<LazyFrame> {
-    let financialslf = read_csv("financials_ttm", None)?;
-    let financialslf = adjust_fundamentals(financialslf);
-
-    let mut financialsdf = timed!("adjusting fundamentals", financialslf.collect())?;
+/// Writes the financials_ttm table with adjusted fundamentals and derived metrics.
+fn write_financials_ttm() -> Result<LazyFrame> {
+    let lf = read_csv("financials_ttm", None)?;
+    let lf = adjust_financials_ttm(lf);
+    let lf = financials_ttm_metrics(lf);
 
     timed!(
         "writing financials_ttm",
-        df_to_duckdb(&mut financialsdf, "financials_ttm")
+        lf_to_duckdb(lf.clone(), "financials_ttm")
     )?;
 
-    Ok(compute_fundamental_metrics(financialsdf.lazy()))
+    Ok(lf)
 }
 
-/// Writes the financials_quarter table from ARQ fundamentals.
-fn write_financials_quarter(prices: &DataFrame) -> Result<LazyFrame> {
-    let financialslf = read_csv("financials_quarter", None)?;
-    let financialslf = adjust_fundamentals_quarter(financialslf);
-
-    let mut financialsdf = timed!("adjusting quarterly fundamentals", financialslf.collect())?;
+/// Writes the financials_qtr table from ARQ fundamentals.
+fn write_financials_qtr(prices: &DataFrame) -> Result<LazyFrame> {
+    let lf = read_csv("financials_qtr", None)?;
+    let lf = adjust_financials_qtr(lf);
+    let price_closes = prices.select(["ticker", "date", "close"])?;
+    let lf = financials_qtr_metrics(lf, price_closes.lazy());
 
     timed!(
-        "writing financials_quarter",
-        df_to_duckdb(&mut financialsdf, "financials_quarter")
+        "writing financials_qtr",
+        lf_to_duckdb(lf.clone(), "financials_qtr")
     )?;
 
-    let price_closes = prices.select(["ticker", "date", "close"])?;
-
-    Ok(compute_quarterly_fundamental_metrics(
-        financialsdf.lazy(),
-        price_closes.lazy(),
-    ))
+    Ok(lf)
 }
 
 /// Writes the companies table including latest price and fundamental data
 fn write_companies(
     prices: DataFrame,
-    financials: LazyFrame,
-    financials_quarter: LazyFrame,
+    financials_ttm: LazyFrame,
+    financials_qtr: LazyFrame,
 ) -> Result<()> {
-    let companieslf = read_csv("companies", None)?;
-    let companieslf =
-        build_company_snapshot(companieslf, prices.lazy(), financials, financials_quarter);
+    let companies = read_csv("companies", None)?;
+    let companies =
+        build_company_snapshot(companies, prices.lazy(), financials_ttm, financials_qtr);
 
-    timed!("writing companies", lf_to_duckdb(companieslf, "companies"))?;
+    timed!("writing companies", lf_to_duckdb(companies, "companies"))?;
 
     Ok(())
 }
 
 /// Writes the insider transactions table
 fn write_insiders() -> Result<()> {
-    let insiderslf = read_csv("insiders", Some(&[("formtype", DataType::String)]))?;
-    let insiderslf = update_insiders(insiderslf);
+    let lf = read_csv("insiders", Some(&[("formtype", DataType::String)]))?;
+    let lf = update_insiders(lf);
 
-    timed!("writing insiders", lf_to_duckdb(insiderslf, "insiders"))?;
+    timed!("writing insiders", lf_to_duckdb(lf, "insiders"))?;
 
     Ok(())
 }
@@ -138,9 +132,9 @@ pub fn run_writer(export_arrow: bool, write_weekly: bool, compute_hurst: bool) -
     if write_weekly {
         write_stocks_weekly(compute_hurst)?;
     }
-    let financials = write_financials()?;
-    let financials_quarter = write_financials_quarter(&prices)?;
-    write_companies(prices, financials, financials_quarter)?;
+    let financials = write_financials_ttm()?;
+    let financials_qtr = write_financials_qtr(&prices)?;
+    write_companies(prices, financials, financials_qtr)?;
     write_insiders()?;
     if export_arrow {
         write_arrow_files()?;

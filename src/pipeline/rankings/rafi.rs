@@ -88,7 +88,7 @@ pub(in crate::pipeline) fn add_rafi_features(lf: LazyFrame) -> LazyFrame {
             .then(lit(NULL))
             .otherwise(f("revenue"));
         [
-            pct(safe_div(f("ebit"), f("revenue"))).alias("__q_ebitmargin_metric"),
+            pct(safe_div(f("ebitadj"), f("revenue"))).alias("__q_ebitmargin_metric"),
             cagr(col("sps"), 5).alias("__q_revenuecagr5y_metric"),
             cagr(f("assetturnover"), 3).alias("__q_salesassetscagr3y_metric"),
             cagr(safe_div(f("gp"), assets_safe.clone()), 3)
@@ -99,8 +99,8 @@ pub(in crate::pipeline) fn add_rafi_features(lf: LazyFrame) -> LazyFrame {
             cagr(f("rnd"), 3).alias("__q_rndcagr3y_metric"),
             ratio(f("ncfo"), f("opinc")).alias("__q_cfc_metric"),
             ratio(f("fcf"), assets_safe.clone()).alias("__q_fcfassets_metric"),
-            ratio(f("ncfo") - f("ebit"), assets_safe.clone()).alias("__q_cashaccruals_metric"),
-            ratio(f("ebit"), f("intexp")).alias("__q_icr_metric"),
+            ratio(f("ncfo") - f("ebitadj"), assets_safe.clone()).alias("__q_cashaccruals_metric"),
+            ratio(f("ebitadj"), f("intexp")).alias("__q_icr_metric"),
             ratio(f("cashneq"), assets_safe.clone()).alias("__q_cashassets_metric"),
             ratio(f("gp"), assets_safe.clone()).alias("__q_gpassets_metric"),
             ratio(f("intangibles"), assets_safe).alias("__q_intangiblesassets_metric"),

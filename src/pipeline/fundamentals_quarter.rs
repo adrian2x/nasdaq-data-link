@@ -77,7 +77,7 @@ fn join_report_closes(lf: LazyFrame, price_closes: LazyFrame) -> LazyFrame {
 }
 
 /// Adds study-style quarterly signals from ARQ fundamentals.
-pub fn compute_quarterly_fundamental_metrics(lf: LazyFrame, price_closes: LazyFrame) -> LazyFrame {
+pub fn financials_qtr_metrics(lf: LazyFrame, price_closes: LazyFrame) -> LazyFrame {
     join_report_closes(lf, price_closes)
         .sort(["ticker", "calendardate"], Default::default())
         .with_columns({
@@ -107,8 +107,8 @@ pub fn compute_quarterly_fundamental_metrics(lf: LazyFrame, price_closes: LazyFr
         .drop(["__report_close"])
 }
 
-/// Normalizes raw ARQ fundamentals for the persisted `financials_quarter` table.
-pub fn adjust_fundamentals_quarter(lf: LazyFrame) -> LazyFrame {
+/// Normalizes raw ARQ fundamentals for the persisted `financials_qtr` table.
+pub fn adjust_financials_qtr(lf: LazyFrame) -> LazyFrame {
     lf.with_columns([
         col("calendardate").cast(DataType::Date),
         col(REPORT_PERIOD).cast(DataType::Date),
